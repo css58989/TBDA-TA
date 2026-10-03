@@ -200,25 +200,66 @@ def iter_local_files(local_dir: Path, key_contains: str) -> Iterator[tuple[str, 
             yield str(path), path
 
 
-def make_r2_client():
+def _clean_env(name: str) -> str:
+    value = os.environ.get(name, "")
+    # Secrets pasted into GitHub often pick up trailing newlines/spaces.
+    return value.strip().strip('"').strip("'")
+
+
+def _normalize_endpoint(endpoint: str, bucket: str) -> str:
+    endpoint = endpoint.strip().rstrip("/")
+    if not endpoint.startswith("http://") and not endpoint.startswith("https://"):
+        endpoint = "https://" + endpoint
+    # Common misconfig: endpoint includes /bucket-name
+    if bucket and endpoint.endswith("/" + bucket):
+        endpoint = endpoint[: -(len(bucket) + 1)]
+    return endpoint
+
+
+def make_r2_client(bucket: Optional[str] = None):
     import boto3
     from botocore.config import Config
 
-    access_key = os.environ.get("CF_R2_ACCESS_KEY_ID")
-    secret_key = os.environ.get("CF_R2_SECRET_ACCESS_KEY")
-    endpoint = os.environ.get("CF_R2_ENDPOINT_URL")
-    if not all([access_key, secret_key, endpoint]):
+    access_key = _clean_env("CF_R2_ACCESS_KEY_ID")
+    secret_key = _clean_env("CF_R2_SECRET_ACCESS_KEY")
+    endpoint = _clean_env("CF_R2_ENDPOINT_URL")
+    bucket = (bucket or _clean_env("CF_R2_BUCKET_NAME")).strip()
+    if not all([access_key, secret_key, endpoint, bucket]):
         raise SystemExit(
             "Missing R2 credentials. Set CF_R2_ACCESS_KEY_ID, "
-            "CF_R2_SECRET_ACCESS_KEY, CF_R2_ENDPOINT_URL."
+            "CF_R2_SECRET_ACCESS_KEY, CF_R2_ENDPOINT_URL, CF_R2_BUCKET_NAME."
         )
+
+    endpoint = _normalize_endpoint(endpoint, bucket)
+    print(f"R2 endpoint : {endpoint}")
+    print(f"R2 bucket   : {bucket}")
+    print(f"R2 key id   : {access_key[:4]}...{access_key[-4:] if len(access_key) > 8 else ''}")
+
     return boto3.client(
         "s3",
         endpoint_url=endpoint,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
-        region_name=os.environ.get("AWS_REGION", "auto"),
-        config=Config(signature_version="s3v4", retries={"max_attempts": 10, "mode": "standard"}),
+        region_name=_clean_env("AWS_REGION") or "auto",
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            retries={"max_attempts": 10, "mode": "standard"},
+        ),
+    )
+
+
+def _r2_access_denied_help(exc: Exception, bucket: str, prefix: str) -> str:
+    return (
+        f"R2 AccessDenied while listing s3://{bucket}/{prefix}\n"
+        f"Original error: {exc}\n\n"
+        "Check GitHub secrets / R2 token setup:\n"
+        "  1) CF_R2_ENDPOINT_URL must be https://<ACCOUNT_ID>.r2.cloudflarestorage.com\n"
+        "     (no bucket name in the URL path)\n"
+        "  2) CF_R2_BUCKET_NAME must be only the bucket name\n"
+        "  3) Use an R2 S3 API token (R2 > Manage R2 API Tokens), not a general CF API token\n"
+        "  4) Token needs Object Read + List (or Admin Read) on this bucket\n"
+        "  5) Re-paste secrets with no trailing spaces/newlines\n"
     )
 
 
@@ -313,12 +354,21 @@ def run_local(local_dir: Path, key_contains: str, max_examples: int) -> tuple[di
 
 
 def run_r2(prefix: str, key_contains: str, max_examples: int, max_files: Optional[int]) -> tuple[dict[str, PathStats], RunSummary]:
-    bucket = os.environ.get("CF_R2_BUCKET_NAME")
+    from botocore.exceptions import ClientError
+
+    bucket = _clean_env("CF_R2_BUCKET_NAME")
     if not bucket:
         raise SystemExit("Missing CF_R2_BUCKET_NAME")
 
-    client = make_r2_client()
-    keys = list_r2_keys(client, bucket, prefix, key_contains)
+    client = make_r2_client(bucket=bucket)
+    print(f"Listing prefix: {prefix or '(bucket root)'}")
+    try:
+        keys = list_r2_keys(client, bucket, prefix, key_contains)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "AllAccessDisabled"}:
+            raise SystemExit(_r2_access_denied_help(exc, bucket, prefix)) from exc
+        raise
     if max_files is not None:
         keys = keys[:max_files]
 

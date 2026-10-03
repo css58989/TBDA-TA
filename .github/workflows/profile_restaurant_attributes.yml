@@ -44,6 +44,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Verify R2 secrets are present
+        env:
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in CF_R2_ACCESS_KEY_ID CF_R2_SECRET_ACCESS_KEY CF_R2_ENDPOINT_URL CF_R2_BUCKET_NAME; do
+            value="${!name}"
+            if [ -z "${value// }" ]; then
+              echo "::error::$name is empty or not set in repository secrets"
+              missing=1
+            else
+              echo "$name is set (length=${#value})"
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
       - name: Profile attributes from Cloudflare R2
         env:
           CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
