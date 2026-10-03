@@ -6,7 +6,7 @@ on:
       r2_prefix:
         description: "R2 key prefix to scan"
         required: false
-        default: "merged-restaurant-info/"
+        default: "merged-restaurant-info/year=2025/month=09/day=17/"
         type: string
       key_contains:
         description: "Only include keys containing this substring"
@@ -50,7 +50,7 @@ jobs:
           CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
           CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
           CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
-          R2_PREFIX: ${{ github.event.inputs.r2_prefix || 'merged-restaurant-info/' }}
+          R2_PREFIX: ${{ github.event.inputs.r2_prefix || 'merged-restaurant-info/year=2025/month=09/day=17/' }}
           R2_KEY_CONTAINS: ${{ github.event.inputs.key_contains || 'MergedRestaurantsInfo.json' }}
           PROFILE_MODE: r2
         run: |

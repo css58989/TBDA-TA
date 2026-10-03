@@ -5,8 +5,10 @@ Profile merged-restaurant-info attributes across Cloudflare R2 (or local files).
 Writes local reports under --out-dir (default: outputs/, gitignored).
 In CI these are uploaded as GitHub Actions artifacts only (not committed).
 
-Expected R2 layout:
-  merged-restaurant-info/year=YYYY/month=MM/day=DD/<area>/<area>_MergedRestaurantsInfo.json
+Default R2 prefix (day folder only):
+  merged-restaurant-info/year=2025/month=09/day=17/
+Layout under that prefix:
+  <area>/<area>_MergedRestaurantsInfo.json
 """
 
 from __future__ import annotations
@@ -491,8 +493,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--local-dir", type=Path, default=None, help="Local directory of JSON files (local mode)")
     p.add_argument(
         "--prefix",
-        default=os.environ.get("R2_PREFIX", "merged-restaurant-info/"),
-        help="R2 key prefix (default: merged-restaurant-info/)",
+        default=os.environ.get(
+            "R2_PREFIX",
+            "merged-restaurant-info/year=2025/month=09/day=17/",
+        ),
+        help="R2 key prefix (default: merged-restaurant-info/year=2025/month=09/day=17/)",
     )
     p.add_argument(
         "--key-contains",
