@@ -207,12 +207,22 @@ def _clean_env(name: str) -> str:
 
 
 def _normalize_endpoint(endpoint: str, bucket: str) -> str:
+    from urllib.parse import urlparse
+
     endpoint = endpoint.strip().rstrip("/")
     if not endpoint.startswith("http://") and not endpoint.startswith("https://"):
         endpoint = "https://" + endpoint
     # Common misconfig: endpoint includes /bucket-name
     if bucket and endpoint.endswith("/" + bucket):
         endpoint = endpoint[: -(len(bucket) + 1)]
+
+    parsed = urlparse(endpoint)
+    host = parsed.netloc.lower()
+    # Common misconfig: https://<bucket>.<account>.r2.cloudflarestorage.com
+    if bucket and host.startswith(bucket.lower() + ".") and host.endswith(".r2.cloudflarestorage.com"):
+        account_host = host[len(bucket) + 1 :]
+        endpoint = f"{parsed.scheme}://{account_host}"
+        print(f"Normalized endpoint host from bucket subdomain -> {endpoint}")
     return endpoint
 
 
@@ -231,9 +241,11 @@ def make_r2_client(bucket: Optional[str] = None):
         )
 
     endpoint = _normalize_endpoint(endpoint, bucket)
+    # Never print full secrets; GitHub may also mask bucket if it equals a secret value.
     print(f"R2 endpoint : {endpoint}")
     print(f"R2 bucket   : {bucket}")
     print(f"R2 key id   : {access_key[:4]}...{access_key[-4:] if len(access_key) > 8 else ''}")
+    print(f"R2 key len  : access={len(access_key)} secret={len(secret_key)}")
 
     return boto3.client(
         "s3",
@@ -249,17 +261,47 @@ def make_r2_client(bucket: Optional[str] = None):
     )
 
 
+def probe_r2_access(client, bucket: str, prefix: str) -> None:
+    """Run small permission probes so AccessDenied is easier to interpret."""
+    from botocore.exceptions import ClientError
+
+    checks = [
+        ("HeadBucket", lambda: client.head_bucket(Bucket=bucket)),
+        (
+            "ListObjectsV2(root, MaxKeys=1)",
+            lambda: client.list_objects_v2(Bucket=bucket, MaxKeys=1),
+        ),
+        (
+            f"ListObjectsV2(prefix={prefix!r}, MaxKeys=1)",
+            lambda: client.list_objects_v2(Bucket=bucket, Prefix=prefix or "", MaxKeys=1),
+        ),
+    ]
+    print("R2 permission probes:")
+    for name, fn in checks:
+        try:
+            fn()
+            print(f"  [ok]   {name}")
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "Unknown")
+            print(f"  [fail] {name} -> {code}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [fail] {name} -> {exc}")
+
+
 def _r2_access_denied_help(exc: Exception, bucket: str, prefix: str) -> str:
     return (
         f"R2 AccessDenied while listing s3://{bucket}/{prefix}\n"
         f"Original error: {exc}\n\n"
-        "Check GitHub secrets / R2 token setup:\n"
-        "  1) CF_R2_ENDPOINT_URL must be https://<ACCOUNT_ID>.r2.cloudflarestorage.com\n"
-        "     (no bucket name in the URL path)\n"
-        "  2) CF_R2_BUCKET_NAME must be only the bucket name\n"
-        "  3) Use an R2 S3 API token (R2 > Manage R2 API Tokens), not a general CF API token\n"
-        "  4) Token needs Object Read + List (or Admin Read) on this bucket\n"
-        "  5) Re-paste secrets with no trailing spaces/newlines\n"
+        "Your Access Key ID was accepted enough to reach authorization, so this is usually\n"
+        "a token/bucket permission mismatch (not a missing secret).\n\n"
+        "Fix in Cloudflare dashboard:\n"
+        "  1) R2 -> Manage R2 API Tokens -> Create API token\n"
+        "  2) Permissions: Object Read & Write  OR  Admin Read\n"
+        "     (Object Read alone is OK only if List is included for that bucket)\n"
+        "  3) Apply to specific bucket: must match CF_R2_BUCKET_NAME exactly\n"
+        "     (most common failure: token scoped to another bucket)\n"
+        "  4) CF_R2_ENDPOINT_URL = https://<ACCOUNT_ID>.r2.cloudflarestorage.com\n"
+        "  5) Update all 4 GitHub secrets with the new token values and re-run\n"
     )
 
 
@@ -362,11 +404,12 @@ def run_r2(prefix: str, key_contains: str, max_examples: int, max_files: Optiona
 
     client = make_r2_client(bucket=bucket)
     print(f"Listing prefix: {prefix or '(bucket root)'}")
+    probe_r2_access(client, bucket, prefix)
     try:
         keys = list_r2_keys(client, bucket, prefix, key_contains)
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
-        if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "AllAccessDisabled"}:
+        if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch", "AllAccessDisabled", "403"}:
             raise SystemExit(_r2_access_denied_help(exc, bucket, prefix)) from exc
         raise
     if max_files is not None:
