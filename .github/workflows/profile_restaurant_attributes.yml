@@ -1,0 +1,78 @@
+name: Profile Merged Restaurant Attributes
+
+on:
+  workflow_dispatch:
+    inputs:
+      r2_prefix:
+        description: "R2 key prefix to scan"
+        required: false
+        default: "merged-restaurant-info/"
+        type: string
+      key_contains:
+        description: "Only include keys containing this substring"
+        required: false
+        default: "MergedRestaurantsInfo.json"
+        type: string
+      max_files:
+        description: "Optional max files to scan (leave empty for all)"
+        required: false
+        default: ""
+        type: string
+  schedule:
+    # Weekly Monday 03:15 UTC
+    - cron: "15 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    name: Scan R2 and build attribute report
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Profile attributes from Cloudflare R2
+        env:
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+          R2_PREFIX: ${{ github.event.inputs.r2_prefix || 'merged-restaurant-info/' }}
+          R2_KEY_CONTAINS: ${{ github.event.inputs.key_contains || 'MergedRestaurantsInfo.json' }}
+          PROFILE_MODE: r2
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ -n "${{ github.event.inputs.max_files }}" ]; then
+            EXTRA_ARGS+=(--max-files "${{ github.event.inputs.max_files }}")
+          fi
+          mkdir -p outputs
+          python scripts/profile_merged_restaurant_attributes.py \
+            --mode r2 \
+            --prefix "${R2_PREFIX}" \
+            --key-contains "${R2_KEY_CONTAINS}" \
+            --out-dir outputs \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: restaurant-attribute-profile
+          path: |
+            outputs/important_attributes_with_examples.txt
+            outputs/attribute_profile_summary.json
+          if-no-files-found: error
+          retention-days: 30
