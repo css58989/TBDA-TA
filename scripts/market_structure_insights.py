@@ -7,8 +7,8 @@ In R2 mode, also loads shoparea_and_id.xlsx from the same day prefix:
   merged-restaurant-info/year=2025/month=09/day=17/shoparea_and_id.xlsx
 
 Writes per-question files under --out-dir (uploaded as a GitHub Actions artifact in CI):
-  - JSON with explanation for Q1, Q2, Q3, Q5
-  - Excel for Q4, Q6, Q7, Q8, Q9, Q10, Q11
+  - JSON with explanation for Q1, Q2, Q5
+  - Excel for Q3, Q4, Q6, Q7, Q8, Q9, Q10, Q11
 
 Special franchise handling (McDonald's, McCafe, Starbucks):
 each branch often has its own restaurantId (see data/franchise_restaurant_id_check.json).
@@ -371,28 +371,33 @@ def branches_per_entity(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["branch_count", "display_name"], ascending=[False, True]).reset_index(drop=True)
 
 
-def answer_q3(per_entity: pd.DataFrame) -> dict[str, Any]:
-    dist = per_entity["branch_count"].value_counts().sort_index()
-    top = per_entity.head(50)
+def sheet_q3(per_entity: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    dist = (
+        per_entity["branch_count"]
+        .value_counts()
+        .sort_index()
+        .rename_axis("branch_count")
+        .reset_index(name="restaurant_entities")
+    )
+    explanation = pd.DataFrame(
+        [
+            {
+                "question_number": 3,
+                "question": "عدد الفروع لكل مطعم / Branches per restaurant",
+                "explanation": (
+                    "Full list of restaurant entities with branch_count. "
+                    "For normal restaurants, branches share one restaurantId and differ by branchId. "
+                    "For McDonald's, McCafe, and Starbucks, each branch usually has its own restaurantId, "
+                    "so branches are counted under the brand entity instead."
+                ),
+                "row_count": int(len(per_entity)),
+            }
+        ]
+    )
     return {
-        "question_number": 3,
-        "question": "عدد الفروع لكل مطعم / Branches per restaurant",
-        "explanation": (
-            "For normal restaurants, branches share one restaurantId and differ by branchId. "
-            "For McDonald's, McCafe, and Starbucks, each branch usually has its own restaurantId, "
-            "so branches are counted under the brand entity instead."
-        ),
-        "methodology": (
-            "Build entity table: restaurantId groups for non-special rows; brand groups for "
-            "McDonald's/McCafe/Starbucks. branch_count = nunique(branchId) per entity."
-        ),
-        "answer": {
-            "restaurant_entities": int(len(per_entity)),
-            "branch_count_distribution": {str(int(k)): int(v) for k, v in dist.items()},
-            "top_50_by_branch_count": top.to_dict(orient="records"),
-            "note": "Full multi-branch name list is in q04_multi_branch_restaurants.xlsx",
-        },
-        "generated_at": utc_now(),
+        "explanation": explanation,
+        "branches_per_restaurant": per_entity.copy(),
+        "branch_count_distribution": dist,
     }
 
 
@@ -870,14 +875,13 @@ def main() -> int:
 
     q1 = answer_q1(df)
     q2 = answer_q2(df)
-    q3 = answer_q3(per_entity)
     q5 = answer_q5(per_entity, df)
 
     write_json(out / "q01_total_restaurants.json", q1)
     write_json(out / "q02_total_branches.json", q2)
-    write_json(out / "q03_branches_per_restaurant.json", q3)
     write_json(out / "q05_avg_branches_per_restaurant.json", q5)
 
+    write_excel(out / "q03_branches_per_restaurant.xlsx", sheet_q3(per_entity))
     write_excel(out / "q04_multi_branch_restaurants.xlsx", sheet_q4(per_entity))
     write_excel(out / "q06_restaurants_by_city.xlsx", sheet_q6(df))
     write_excel(out / "q07_branches_by_area.xlsx", sheet_q7(df))
@@ -898,10 +902,10 @@ def main() -> int:
             "json": [
                 "q01_total_restaurants.json",
                 "q02_total_branches.json",
-                "q03_branches_per_restaurant.json",
                 "q05_avg_branches_per_restaurant.json",
             ],
             "excel": [
+                "q03_branches_per_restaurant.xlsx",
                 "q04_multi_branch_restaurants.xlsx",
                 "q06_restaurants_by_city.xlsx",
                 "q07_branches_by_area.xlsx",
