@@ -13,9 +13,10 @@ Thumbs.db
 tmp/
 .cache/
 *.log
-data/
+
 
 # Generated reports — download from GitHub Actions artifacts only
 outputs/*
 !outputs/README.md
 outputs/README.md
+data/*

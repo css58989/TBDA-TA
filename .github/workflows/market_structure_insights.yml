@@ -91,11 +91,12 @@ jobs:
             EXTRA_ARGS+=(--max-files "${{ github.event.inputs.max_files }}")
           fi
           mkdir -p outputs/market_structure
+          # shoparea_and_id.xlsx is read from R2 under the same day prefix:
+          #   merged-restaurant-info/year=2025/month=09/day=17/shoparea_and_id.xlsx
           python scripts/market_structure_insights.py \
             --mode r2 \
             --prefix "${R2_PREFIX}" \
             --key-contains "${R2_KEY_CONTAINS}" \
-            --area-map data/shoparea_and_id.xlsx \
             --out-dir outputs/market_structure \
             "${EXTRA_ARGS[@]}"
 

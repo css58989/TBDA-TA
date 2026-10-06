@@ -3,7 +3,10 @@
 Market / Restaurant Structure insights (insightspart1.txt questions 1-11).
 
 Reads merged-restaurant-info from Cloudflare R2 (CI) or local JSON files.
-Writes per-question artifacts under --out-dir:
+In R2 mode, also loads shoparea_and_id.xlsx from the same day prefix:
+  merged-restaurant-info/year=2025/month=09/day=17/shoparea_and_id.xlsx
+
+Writes per-question files under --out-dir (uploaded as a GitHub Actions artifact in CI):
   - JSON with explanation for Q1, Q2, Q3, Q5
   - Excel for Q4, Q6, Q7, Q8, Q9, Q10, Q11
 
@@ -109,17 +112,52 @@ def coord_in_kuwait(lat: float, lon: float) -> bool:
     return KUWAIT_LAT[0] <= lat <= KUWAIT_LAT[1] and KUWAIT_LON[0] <= lon <= KUWAIT_LON[1]
 
 
-def load_area_map(path: Path) -> dict[int, str]:
-    df = pd.read_excel(path)
+DEFAULT_AREA_MAP_FILENAME = "shoparea_and_id.xlsx"
+
+
+def area_map_key_under_prefix(prefix: str, filename: str = DEFAULT_AREA_MAP_FILENAME) -> str:
+    prefix = (prefix or "").strip()
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return f"{prefix}{filename}"
+
+
+def load_area_map_from_excel(source: Any, label: str) -> dict[int, str]:
+    df = pd.read_excel(source)
     if "area_id" not in df.columns or "area_name" not in df.columns:
-        raise SystemExit(f"Expected columns area_id, area_name in {path}")
+        raise SystemExit(f"Expected columns area_id, area_name in {label}")
     out: dict[int, str] = {}
     for _, r in df.iterrows():
         try:
             out[int(r["area_id"])] = str(r["area_name"])
         except (TypeError, ValueError):
             continue
+    if not out:
+        raise SystemExit(f"No area rows loaded from {label}")
+    print(f"[ok] area map: {label} ({len(out)} areas)")
     return out
+
+
+def load_area_map_local(path: Path) -> dict[int, str]:
+    if not path.exists():
+        raise SystemExit(f"Area map not found: {path}")
+    return load_area_map_from_excel(path, str(path))
+
+
+def load_area_map_r2(client, bucket: str, key: str) -> dict[int, str]:
+    from io import BytesIO
+
+    from botocore.exceptions import ClientError
+
+    try:
+        obj = client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        raise SystemExit(
+            f"Area map not found in R2 at s3://{bucket}/{key}\n"
+            f"Upload shoparea_and_id.xlsx under the day prefix. Original error: {exc}"
+        ) from exc
+    raw = obj["Body"].read()
+    return load_area_map_from_excel(BytesIO(raw), f"s3://{bucket}/{key}")
 
 
 def load_records_local(local_dir: Path, key_contains: str, max_files: Optional[int]) -> tuple[list[dict], list[str]]:
@@ -140,9 +178,13 @@ def load_records_local(local_dir: Path, key_contains: str, max_files: Optional[i
     return records, sources
 
 
-def load_records_r2(prefix: str, key_contains: str, max_files: Optional[int]) -> tuple[list[dict], list[str]]:
-    bucket = clean_env("CF_R2_BUCKET_NAME")
-    client = make_r2_client(bucket=bucket)
+def load_records_r2(
+    client,
+    bucket: str,
+    prefix: str,
+    key_contains: str,
+    max_files: Optional[int],
+) -> tuple[list[dict], list[str]]:
     keys = list_r2_keys(client, bucket, prefix, key_contains)
     if max_files is not None:
         keys = keys[:max_files]
@@ -443,8 +485,8 @@ def sheet_q7(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
                 "question_number": 7,
                 "question": "توزيع الفروع حسب المنطقة / Branch distribution by shopArea",
                 "explanation": (
-                    "Grouped by shopArea. Area names come from data/shoparea_and_id.xlsx "
-                    "(area_id -> area_name)."
+                    "Grouped by shopArea. Area names come from shoparea_and_id.xlsx "
+                    "(area_id -> area_name), loaded from R2 under the day prefix in CI."
                 ),
             }
         ]
@@ -530,7 +572,7 @@ def sheet_q8(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
                     "Density is unique restaurant entities per approximate km^2 of the area's "
                     "geo-validated coordinates. Coordinates outside Kuwait bounds or farther than "
                     f"{COORD_OUTLIER_KM} km from the area median lat/lon are flagged as likely wrong "
-                    "and excluded from coverage/density math. shopArea names from shoparea_and_id.xlsx."
+                    "and excluded from coverage/density math. shopArea names from R2 shoparea_and_id.xlsx."
                 ),
             }
         ]
@@ -756,8 +798,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--area-map",
         type=Path,
-        default=ROOT / "data" / "shoparea_and_id.xlsx",
-        help="Excel mapping area_id -> area_name",
+        default=None,
+        help="Local Excel mapping area_id -> area_name (local mode only; optional)",
+    )
+    p.add_argument(
+        "--area-map-key",
+        default=os.environ.get("AREA_MAP_R2_KEY", ""),
+        help=(
+            "R2 object key for shoparea_and_id.xlsx. "
+            "Default: <prefix>/shoparea_and_id.xlsx"
+        ),
     )
     p.add_argument(
         "--out-dir",
@@ -770,9 +820,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if not args.area_map.exists():
-        raise SystemExit(f"Area map not found: {args.area_map}")
-    area_map = load_area_map(args.area_map)
+    area_map_source = ""
 
     if args.mode == "local":
         local_dir = args.local_dir
@@ -781,10 +829,35 @@ def main() -> int:
             local_dir = candidate if candidate.exists() else ROOT / "sample_data"
         if not local_dir.exists():
             raise SystemExit(f"Local directory not found: {local_dir}")
+
+        area_path = args.area_map
+        if area_path is None:
+            for candidate in (
+                local_dir / DEFAULT_AREA_MAP_FILENAME,
+                ROOT / "data" / DEFAULT_AREA_MAP_FILENAME,
+                ROOT.parent / DEFAULT_AREA_MAP_FILENAME,
+            ):
+                if candidate.exists():
+                    area_path = candidate
+                    break
+        if area_path is None:
+            raise SystemExit(
+                f"Area map not found. Place {DEFAULT_AREA_MAP_FILENAME} next to local JSON "
+                "or pass --area-map"
+            )
+        area_map = load_area_map_local(area_path)
+        area_map_source = str(area_path)
         records, sources = load_records_local(local_dir, args.key_contains, args.max_files)
         mode = "local"
     else:
-        records, sources = load_records_r2(args.prefix, args.key_contains, args.max_files)
+        bucket = clean_env("CF_R2_BUCKET_NAME")
+        client = make_r2_client(bucket=bucket)
+        area_key = (args.area_map_key or "").strip() or area_map_key_under_prefix(args.prefix)
+        area_map = load_area_map_r2(client, bucket, area_key)
+        area_map_source = f"s3://{bucket}/{area_key}"
+        records, sources = load_records_r2(
+            client, bucket, args.prefix, args.key_contains, args.max_files
+        )
         mode = "r2"
 
     if not records:
@@ -844,9 +917,10 @@ def main() -> int:
             "total_unique_branches": q2["answer"]["total_unique_branch_ids"],
             "avg_branches_per_restaurant_entity": q5["answer"]["avg_branches_per_restaurant_entity"],
         },
+        "area_map_source": area_map_source,
         "reference_inputs": [
             "data/insightspart1.txt",
-            "data/shoparea_and_id.xlsx",
+            area_map_source,
             "data/franchise_restaurant_id_check.json",
             "data/franchise_insights.json",
         ],
