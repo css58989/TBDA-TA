@@ -1,0 +1,108 @@
+name: Market Structure Insights
+
+on:
+  workflow_dispatch:
+    inputs:
+      r2_prefix:
+        description: "R2 key prefix to scan"
+        required: false
+        default: "merged-restaurant-info/year=2025/month=09/day=17/"
+        type: string
+      key_contains:
+        description: "Only include keys containing this substring"
+        required: false
+        default: "MergedRestaurantsInfo.json"
+        type: string
+      max_files:
+        description: "Optional max files to scan (leave empty for all)"
+        required: false
+        default: ""
+        type: string
+  schedule:
+    # Weekly Monday 04:00 UTC (after attribute profile)
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  insights:
+    name: Build market structure Q1-Q11 artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify R2 secrets are present
+        env:
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in CF_R2_ACCESS_KEY_ID CF_R2_SECRET_ACCESS_KEY CF_R2_ENDPOINT_URL CF_R2_BUCKET_NAME; do
+            value="${!name}"
+            if [ -z "${value// }" ]; then
+              echo "::error::$name is empty or not set in repository secrets"
+              missing=1
+            else
+              echo "$name is set (length=${#value})"
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Diagnose R2 access
+        env:
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+          R2_PREFIX: ${{ github.event.inputs.r2_prefix || 'merged-restaurant-info/year=2025/month=09/day=17/' }}
+        run: python scripts/diagnose_r2.py
+
+      - name: Run market structure insights
+        env:
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+          R2_PREFIX: ${{ github.event.inputs.r2_prefix || 'merged-restaurant-info/year=2025/month=09/day=17/' }}
+          R2_KEY_CONTAINS: ${{ github.event.inputs.key_contains || 'MergedRestaurantsInfo.json' }}
+          INSIGHTS_MODE: r2
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ -n "${{ github.event.inputs.max_files }}" ]; then
+            EXTRA_ARGS+=(--max-files "${{ github.event.inputs.max_files }}")
+          fi
+          mkdir -p outputs/market_structure
+          python scripts/market_structure_insights.py \
+            --mode r2 \
+            --prefix "${R2_PREFIX}" \
+            --key-contains "${R2_KEY_CONTAINS}" \
+            --area-map data/shoparea_and_id.xlsx \
+            --out-dir outputs/market_structure \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Upload GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-structure-insights
+          path: outputs/market_structure/
+          if-no-files-found: error
+          retention-days: 30

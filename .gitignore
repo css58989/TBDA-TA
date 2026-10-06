@@ -15,4 +15,5 @@ tmp/
 *.log
 
 # Generated reports — download from GitHub Actions artifacts only
-outputs/
+outputs/**
+!outputs/README.md
