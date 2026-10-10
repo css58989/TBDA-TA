@@ -88,6 +88,49 @@ _PAREN_SUFFIX_RE = re.compile(
     r"\s*\((?:DH\s*Kitchen|TGO|Talabat\s*GO)[^)]*\)\s*",
     flags=re.IGNORECASE,
 )
+# Text after " - " that looks like a branch/location (not part of the brand name).
+_BRANCH_LOCATION_HINTS: tuple[str, ...] = (
+    "mall",
+    "tower",
+    "kiosk",
+    "club",
+    "co-op",
+    "co op",
+    "kitchen",
+    "restaurants",
+    "land ",
+    "land,",
+    "gate",
+    "lake",
+    "fanar",
+    "avenues",
+    "360",
+    "jahra",
+    "salmiya",
+    "jabriya",
+    "hawall",
+    "farwaniya",
+    "mahboula",
+    "egal",
+    "zahra",
+    "rai",
+    "shuwaikh",
+    "ardhiya",
+    "subhan",
+    "mirqab",
+    "salwa",
+    "fnaitees",
+    "egaliya",
+    "egal",
+    "abdullah",
+    "salem",
+    "mourouj",
+    "nasser",
+    "sidra",
+    "bneid",
+    "reggai",
+    "sabah",
+)
 
 
 def _clean_text(value: object) -> Optional[str]:
@@ -109,20 +152,40 @@ def detect_special_franchise(name: object, branch_name: object = None) -> Option
     return None
 
 
+def _looks_like_branch_location_suffix(suffix: str) -> bool:
+    s = suffix.lower().strip(" ,.-_")
+    if not s:
+        return False
+    if s in {"tgo", "dh kitchen", "talabat go"}:
+        return True
+    return any(hint in s for hint in _BRANCH_LOCATION_HINTS)
+
+
+def brand_core_from_clean_text(text: str) -> str:
+    """Extract brand label from a cleaned restaurant/branch name string."""
+    text = _PAREN_SUFFIX_RE.sub(" ", text)
+    core = text.split(",")[0].strip()
+    if " - " in core:
+        left, right = core.split(" - ", 1)
+        if _looks_like_branch_location_suffix(right):
+            core = left.strip()
+    core = re.sub(r"\s+", " ", core).strip(" -_")
+    return core
+
+
 def normalize_restaurant_name(name: object) -> Optional[str]:
     """
     Brand-level name used for actual_unique entities.
 
     Strips delivery-area / branch location suffixes so that
-    "CocoaVia, Hawally", "Asha's, Jabriya", and "BURGER BOUTIQUE" collapse
-    to one restaurant each when they share a brand name across restaurantIds.
+    "CocoaVia, Hawally", "Asha's, Jabriya", "Shake Shack - 360 Mall, Zahra",
+    and "BURGER BOUTIQUE" collapse to one restaurant each when they share a
+    brand name across restaurantIds.
     """
     text = _clean_text(name)
     if text is None:
         return None
-    text = _PAREN_SUFFIX_RE.sub(" ", text)
-    core = text.split(",")[0].strip()
-    core = re.sub(r"\s+", " ", core).strip(" -_")
+    core = brand_core_from_clean_text(text)
     if not core:
         return None
     return core.lower()
@@ -356,14 +419,20 @@ def _sorted_unique_texts(series: pd.Series) -> list[str]:
 def _display_name_for_group(g: pd.DataFrame, franchise: Optional[str]) -> str:
     if franchise:
         return franchise
+    if g["normalized_name"].notna().any():
+        # Prefer canonical brand from normalization; title-case short brands only.
+        norm = str(g["normalized_name"].dropna().iloc[0])
+        if len(g["name"].dropna()):
+            raw = _clean_text(g["name"].mode().iloc[0]) or ""
+            core = brand_core_from_clean_text(raw)
+            if core:
+                return core
+        return norm
     if len(g["name"].dropna()):
         raw = _clean_text(g["name"].mode().iloc[0]) or ""
-        raw = _PAREN_SUFFIX_RE.sub(" ", raw)
-        core = raw.split(",")[0].strip(" -_")
+        core = brand_core_from_clean_text(raw)
         if core:
             return core
-    if g["normalized_name"].notna().any():
-        return str(g["normalized_name"].dropna().iloc[0])
     return str(g["restaurantId"].iloc[0])
 
 
