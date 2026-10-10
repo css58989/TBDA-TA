@@ -665,7 +665,7 @@ def sheet_q07(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             7,
             "المسافات بين الفروع / Distances between branches",
             (
-                "For multi-branch restaurant entities (brand-aware: McDonald's/McCafe/Starbucks collapsed), "
+                "For multi-branch restaurant entities (name-based actual unique; McDonald's/McCafe/Starbucks and other multi-id brands collapsed), "
                 "pairwise and nearest-sibling distances using geo-validated coordinates. "
                 "Also nearest-neighbor spacing across all branches (market packing). "
                 "Pairwise sheet may be capped for size."
@@ -836,7 +836,7 @@ def sheet_q10(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             (
                 "Per shopArea: unique_branches vs brand-aware unique_restaurant_entities. "
                 "High branches_per_restaurant_entity means chains dominate (many branches, fewer brands). "
-                "McDonald's/McCafe/Starbucks are collapsed to one entity each."
+                "Restaurant entities use normalized name (actual unique); multi-id brands collapse to one entity each."
             ),
         ),
         "by_shopArea": out if len(out) else pd.DataFrame(),

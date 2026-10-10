@@ -8,11 +8,14 @@ In R2 mode, also loads shoparea_and_id.xlsx from the same day prefix:
 
 Writes per-question files under --out-dir (uploaded as a GitHub Actions artifact in CI):
   - JSON with explanation for Q1, Q2, Q5
-  - Excel for Q3, Q4, Q6, Q7, Q8, Q9, Q10, Q11
+  - Excel for Q1-Q4, Q6-Q11 (Q1/Q2 include id+name listing sheets)
 
-Special franchise handling (McDonald's, McCafe, Starbucks):
-each branch often has its own restaurantId (see data/franchise_restaurant_id_check.json).
-For those brands we treat the brand name as the restaurant entity, not restaurantId.
+Restaurant entity keys (used for actual_unique across all questions):
+  - unique_by_restaurant_id = distinct restaurantId
+  - actual_unique_restaurant_entities = distinct normalized restaurant name
+    (area suffixes stripped, e.g. "Asha's, Jabriya" -> "asha's"), with
+    McDonald's / McCafe / Starbucks forced to one brand key each when the
+    name does not use a clean comma pattern.
 """
 
 from __future__ import annotations
@@ -80,21 +83,62 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_APOSTROPHE_RE = re.compile(r"[\u2018\u2019\u02bc`´]")
+_PAREN_SUFFIX_RE = re.compile(
+    r"\s*\((?:DH\s*Kitchen|TGO|Talabat\s*GO)[^)]*\)\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def _clean_text(value: object) -> Optional[str]:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    text = _APOSTROPHE_RE.sub("'", str(value)).strip()
+    return text or None
+
+
 def detect_special_franchise(name: object, branch_name: object = None) -> Optional[str]:
     for value in (name, branch_name):
-        if value is None or (isinstance(value, float) and math.isnan(value)):
+        text = _clean_text(value)
+        if text is None:
             continue
-        text = str(value).lower().replace("`", "'").strip()
+        lowered = text.lower()
         for pattern, label in SPECIAL_FRANCHISE_PATTERNS:
-            if re.search(pattern, text):
+            if re.search(pattern, lowered):
                 return label
     return None
 
 
+def normalize_restaurant_name(name: object) -> Optional[str]:
+    """
+    Brand-level name used for actual_unique entities.
+
+    Strips delivery-area / branch location suffixes so that
+    "CocoaVia, Hawally", "Asha's, Jabriya", and "BURGER BOUTIQUE" collapse
+    to one restaurant each when they share a brand name across restaurantIds.
+    """
+    text = _clean_text(name)
+    if text is None:
+        return None
+    text = _PAREN_SUFFIX_RE.sub(" ", text)
+    core = text.split(",")[0].strip()
+    core = re.sub(r"\s+", " ", core).strip(" -_")
+    if not core:
+        return None
+    return core.lower()
+
+
 def restaurant_entity_key(row: dict[str, Any]) -> str:
+    """
+    Actual unique restaurant entity: prefer special franchise brand, else
+    normalized name, else restaurantId fallback.
+    """
     brand = row.get("special_franchise")
     if brand:
-        return f"franchise:{brand}"
+        return f"name:{str(brand).lower()}"
+    norm = row.get("normalized_name") or normalize_restaurant_name(row.get("name"))
+    if norm:
+        return f"name:{norm}"
     rid = row.get("restaurantId")
     return f"restaurantId:{rid}"
 
@@ -235,11 +279,13 @@ def build_branch_frame(records: list[dict], area_map: dict[int, str]) -> pd.Data
         except (TypeError, ValueError):
             lat_f, lon_f = None, None
 
+        norm_name = normalize_restaurant_name(item.get("name"))
         by_branch[bid] = {
             "branchId": bid,
             "restaurantId": item.get("restaurantId"),
             "name": item.get("name"),
             "branchName": item.get("branchName"),
+            "normalized_name": norm_name,
             "shopCity": shop_city_int,
             "shopCity_label": SHOPCITY_LABELS.get(shop_city_int, f"shopCity_{shop_city_int}"),
             "shopArea": shop_area_int,
@@ -275,6 +321,20 @@ def write_excel(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
     print(f"Wrote {path}")
 
 
+def _display_name_for_group(g: pd.DataFrame, franchise: Optional[str]) -> str:
+    if franchise:
+        return franchise
+    if len(g["name"].dropna()):
+        raw = _clean_text(g["name"].mode().iloc[0]) or ""
+        raw = _PAREN_SUFFIX_RE.sub(" ", raw)
+        core = raw.split(",")[0].strip(" -_")
+        if core:
+            return core
+    if g["normalized_name"].notna().any():
+        return str(g["normalized_name"].dropna().iloc[0])
+    return str(g["restaurantId"].iloc[0])
+
+
 def answer_q1(df: pd.DataFrame) -> dict[str, Any]:
     unique_by_id = int(df["restaurantId"].nunique())
     unique_entities = int(df["entity_key"].nunique())
@@ -288,26 +348,53 @@ def answer_q1(df: pd.DataFrame) -> dict[str, Any]:
         .reset_index()
         .sort_values("special_franchise")
     )
+    # Brands where one normalized name spans multiple restaurantIds (same problem as McCafe).
+    multi_rows = []
+    for entity_key, g in df.groupby("entity_key", dropna=False):
+        n_ids = int(g["restaurantId"].nunique())
+        if n_ids <= 1:
+            continue
+        franchise = (
+            str(g["special_franchise"].dropna().iloc[0])
+            if g["special_franchise"].notna().any()
+            else None
+        )
+        multi_rows.append(
+            {
+                "entity_key": entity_key,
+                "display_name": _display_name_for_group(g, franchise),
+                "branches": int(g["branchId"].nunique()),
+                "unique_restaurantIds": n_ids,
+            }
+        )
+    name_multi_id = pd.DataFrame(multi_rows)
+    if len(name_multi_id):
+        name_multi_id = name_multi_id.sort_values(
+            ["unique_restaurantIds", "branches"], ascending=[False, False]
+        )
     return {
         "question_number": 1,
         "question": "عدد المطاعم الكلي / Total restaurants",
         "explanation": (
-            "Two totals are reported because some brands (McDonald's, McCafe, Starbucks) "
-            "assign a different restaurantId to each branch. "
-            "unique_by_restaurant_id counts distinct restaurantId values. "
-            "actual_unique_restaurant_entities collapses those special franchises to one "
-            "entity per brand and keeps restaurantId for everyone else."
+            "Two totals are reported. unique_by_restaurant_id counts distinct restaurantId values. "
+            "actual_unique_restaurant_entities counts distinct restaurants by normalized name "
+            "(and id only as fallback when name is missing): location suffixes after a comma are "
+            "stripped so Asha's / CocoaVia / Burger Boutique / McDonald's / McCafe / Starbucks "
+            "and similar brands count as one restaurant even when each branch has its own restaurantId."
         ),
         "methodology": (
-            "Deduplicate rows by branchId across delivery-area files, then count "
-            "restaurantId vs brand-aware entity_key. Special brands detected from name/branchName "
-            "using the same patterns documented in franchise_restaurant_id_check.json."
+            "Deduplicate rows by branchId across delivery-area files. "
+            "entity_key = special franchise brand (McDonald's/McCafe/Starbucks) when detected, "
+            "else normalize(name) (apostrophes unified, DH Kitchen/TGO parentheticals removed, "
+            "text before first comma kept, lowercased), else restaurantId."
         ),
         "answer": {
             "unique_by_restaurant_id": unique_by_id,
             "actual_unique_restaurant_entities": unique_entities,
-            "difference_due_to_special_franchises": unique_by_id - unique_entities,
+            "difference_id_vs_name_entities": unique_by_id - unique_entities,
+            "brands_with_multiple_restaurantIds": int(len(name_multi_id)),
             "special_franchises": special.to_dict(orient="records"),
+            "top_multi_id_brands": name_multi_id.head(40).to_dict(orient="records"),
             "unique_branches_context": int(df["branchId"].nunique()),
         },
         "generated_at": utc_now(),
@@ -334,41 +421,247 @@ def answer_q2(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def branches_per_entity(df: pd.DataFrame) -> pd.DataFrame:
+def _restaurants_by_id_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per restaurantId with id + name."""
     rows = []
-    # Normal restaurants: group by restaurantId excluding special franchise rows
-    normal = df[df["special_franchise"].isna()]
-    for rid, g in normal.groupby("restaurantId"):
-        rows.append(
-            {
-                "entity_type": "restaurantId",
-                "entity_key": f"restaurantId:{rid}",
-                "restaurantId": rid,
-                "franchise": None,
-                "display_name": str(g["name"].mode().iloc[0]) if len(g["name"].dropna()) else str(rid),
-                "branch_count": int(g["branchId"].nunique()),
-                "unique_branchIds": int(g["branchId"].nunique()),
-                "unique_restaurantIds": 1,
-            }
+    for rid, g in df.groupby("restaurantId", dropna=False):
+        name = str(g["name"].mode().iloc[0]) if len(g["name"].dropna()) else ""
+        franchise = (
+            str(g["special_franchise"].dropna().iloc[0])
+            if g["special_franchise"].notna().any()
+            else None
         )
-    special = df[df["special_franchise"].notna()]
-    for brand, g in special.groupby("special_franchise"):
         rows.append(
             {
-                "entity_type": "special_franchise",
-                "entity_key": f"franchise:{brand}",
-                "restaurantId": None,
-                "franchise": brand,
-                "display_name": brand,
+                "restaurantId": rid,
+                "name": name,
+                "normalized_name": g["normalized_name"].dropna().iloc[0]
+                if g["normalized_name"].notna().any()
+                else None,
+                "entity_key": g["entity_key"].iloc[0],
+                "display_name": _display_name_for_group(g, franchise),
                 "branch_count": int(g["branchId"].nunique()),
-                "unique_branchIds": int(g["branchId"].nunique()),
-                "unique_restaurantIds": int(g["restaurantId"].nunique()),
             }
         )
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values(["branch_count", "display_name"], ascending=[False, True]).reset_index(drop=True)
+    return out.sort_values(["name", "restaurantId"], ascending=[True, True]).reset_index(drop=True)
+
+
+def _restaurants_actual_unique_sheet(per_entity: pd.DataFrame) -> pd.DataFrame:
+    """One row per actual-unique restaurant entity (normalized name) with id(s) + name."""
+    if per_entity.empty:
+        return pd.DataFrame(
+            columns=[
+                "entity_key",
+                "restaurant_name",
+                "restaurant_ids",
+                "restaurant_names",
+                "unique_restaurantIds",
+                "branch_count",
+                "entity_type",
+            ]
+        )
+    cols = [
+        "entity_key",
+        "restaurant_name",
+        "restaurant_ids",
+        "restaurant_names",
+        "unique_restaurantIds",
+        "branch_count",
+        "branch_ids",
+        "branch_names",
+        "entity_type",
+        "normalized_name",
+        "franchise",
+    ]
+    present = [c for c in cols if c in per_entity.columns]
+    out = per_entity[present].copy()
+    return out.sort_values(
+        ["restaurant_name", "entity_key"], ascending=[True, True]
+    ).reset_index(drop=True)
+
+
+def _branches_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per unique branchId with id + name."""
+    cols = [
+        "branchId",
+        "branchName",
+        "name",
+        "restaurantId",
+        "normalized_name",
+        "entity_key",
+        "special_franchise",
+        "shopCity",
+        "shopCity_label",
+        "shopArea",
+        "shopArea_name",
+    ]
+    present = [c for c in cols if c in df.columns]
+    out = df[present].drop_duplicates(subset=["branchId"]).copy()
+    out = out.rename(columns={"name": "restaurant_name"})
+    return out.sort_values(["branchName", "branchId"], ascending=[True, True]).reset_index(drop=True)
+
+
+def sheet_q1(df: pd.DataFrame, per_entity: pd.DataFrame, q1: dict[str, Any]) -> dict[str, pd.DataFrame]:
+    ans = q1["answer"]
+    explanation = pd.DataFrame(
+        [
+            {
+                "question_number": 1,
+                "question": q1["question"],
+                "explanation": q1["explanation"],
+                "methodology": q1["methodology"],
+                "unique_by_restaurant_id": ans["unique_by_restaurant_id"],
+                "actual_unique_restaurant_entities": ans["actual_unique_restaurant_entities"],
+                "difference_id_vs_name_entities": ans["difference_id_vs_name_entities"],
+                "brands_with_multiple_restaurantIds": ans["brands_with_multiple_restaurantIds"],
+                "unique_branches_context": ans["unique_branches_context"],
+                "generated_at": q1["generated_at"],
+            }
+        ]
+    )
+    by_id = _restaurants_by_id_sheet(df)
+    actual = _restaurants_actual_unique_sheet(per_entity)
+    special = pd.DataFrame(ans.get("special_franchises") or [])
+    multi = pd.DataFrame(ans.get("top_multi_id_brands") or [])
+    return {
+        "explanation": explanation,
+        "restaurants_by_id": by_id,
+        "restaurants_actual_unique": actual,
+        "special_franchises": special if len(special) else pd.DataFrame(columns=["special_franchise"]),
+        "multi_id_brands": multi if len(multi) else pd.DataFrame(columns=["entity_key"]),
+    }
+
+
+def sheet_q2(df: pd.DataFrame, q2: dict[str, Any]) -> dict[str, pd.DataFrame]:
+    ans = q2["answer"]
+    explanation = pd.DataFrame(
+        [
+            {
+                "question_number": 2,
+                "question": q2["question"],
+                "explanation": q2["explanation"],
+                "methodology": q2["methodology"],
+                "total_unique_branch_ids": ans["total_unique_branch_ids"],
+                "generated_at": q2["generated_at"],
+            }
+        ]
+    )
+    branches = _branches_sheet(df)
+    return {
+        "explanation": explanation,
+        "branches": branches,
+    }
+
+
+def _json_list(values: list[Any]) -> str:
+    """Serialize a Python list for Excel cells (JSON array)."""
+    return json.dumps(values, ensure_ascii=False)
+
+
+def _sorted_unique_ids(series: pd.Series) -> list[Any]:
+    ids: list[Any] = []
+    seen: set[Any] = set()
+    for value in series.dropna().tolist():
+        try:
+            key: Any = int(value)
+        except (TypeError, ValueError):
+            key = value
+        if key in seen:
+            continue
+        seen.add(key)
+        ids.append(key)
+    return sorted(ids, key=lambda x: (str(type(x)), str(x)))
+
+
+def _sorted_unique_texts(series: pd.Series) -> list[str]:
+    texts: list[str] = []
+    seen: set[str] = set()
+    for value in series.dropna().tolist():
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        texts.append(text)
+    return sorted(texts, key=str.lower)
+
+
+def branches_per_entity(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for entity_key, g in df.groupby("entity_key", dropna=False):
+        franchise = None
+        if g["special_franchise"].notna().any():
+            franchise = str(g["special_franchise"].dropna().iloc[0])
+        if franchise:
+            entity_type = "special_franchise"
+        elif g["normalized_name"].notna().any():
+            entity_type = "normalized_name"
+        else:
+            entity_type = "restaurantId"
+
+        branch_rows = (
+            g.drop_duplicates(subset=["branchId"])
+            .sort_values(["branchId"], kind="mergesort")
+            .reset_index(drop=True)
+        )
+        restaurant_ids = _sorted_unique_ids(g["restaurantId"])
+        restaurant_names = _sorted_unique_texts(g["name"])
+        branch_ids = _sorted_unique_ids(branch_rows["branchId"])
+        branch_names = _sorted_unique_texts(
+            branch_rows["branchName"].fillna(branch_rows["name"])
+        )
+        branches_detail = []
+        for _, r in branch_rows.iterrows():
+            try:
+                bid = int(r["branchId"]) if pd.notna(r["branchId"]) else r["branchId"]
+            except (TypeError, ValueError):
+                bid = r["branchId"]
+            try:
+                rid = int(r["restaurantId"]) if pd.notna(r["restaurantId"]) else r["restaurantId"]
+            except (TypeError, ValueError):
+                rid = r["restaurantId"]
+            bname = r["branchName"] if pd.notna(r.get("branchName")) else None
+            rname = r["name"] if pd.notna(r.get("name")) else None
+            branches_detail.append(
+                {
+                    "branchId": bid,
+                    "branchName": None if bname is None else str(bname),
+                    "restaurantId": rid,
+                    "restaurantName": None if rname is None else str(rname),
+                }
+            )
+
+        restaurant_name = _display_name_for_group(g, franchise)
+        rows.append(
+            {
+                "entity_type": entity_type,
+                "entity_key": entity_key,
+                "restaurant_name": restaurant_name,
+                "display_name": restaurant_name,  # alias used by older callers / sort keys
+                "franchise": franchise,
+                "normalized_name": g["normalized_name"].dropna().iloc[0]
+                if g["normalized_name"].notna().any()
+                else None,
+                # Keep a representative single id for summary joins; Excel Q3 uses the list columns.
+                "restaurantId": restaurant_ids[0] if restaurant_ids else None,
+                "restaurant_ids": _json_list(restaurant_ids),
+                "restaurant_names": _json_list(restaurant_names),
+                "branch_ids": _json_list(branch_ids),
+                "branch_names": _json_list(branch_names),
+                "branches": _json_list(branches_detail),
+                "branch_count": int(len(branch_ids)),
+                "unique_branchIds": int(len(branch_ids)),
+                "unique_restaurantIds": int(len(restaurant_ids)),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(
+        ["branch_count", "restaurant_name"], ascending=[False, True]
+    ).reset_index(drop=True)
 
 
 def sheet_q3(per_entity: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -385,18 +678,35 @@ def sheet_q3(per_entity: pd.DataFrame) -> dict[str, pd.DataFrame]:
                 "question_number": 3,
                 "question": "عدد الفروع لكل مطعم / Branches per restaurant",
                 "explanation": (
-                    "Full list of restaurant entities with branch_count. "
-                    "For normal restaurants, branches share one restaurantId and differ by branchId. "
-                    "For McDonald's, McCafe, and Starbucks, each branch usually has its own restaurantId, "
-                    "so branches are counted under the brand entity instead."
+                    "One row per actual-unique restaurant (normalized name). "
+                    "restaurant_ids / restaurant_names / branch_ids / branch_names / branches "
+                    "are JSON arrays so multi-id brands (McCafe, Starbucks, Asha's, etc.) keep "
+                    "the full list of ids and names in one row instead of a single restaurantId."
                 ),
                 "row_count": int(len(per_entity)),
             }
         ]
     )
+    detail_cols = [
+        "restaurant_name",
+        "restaurant_ids",
+        "restaurant_names",
+        "branch_count",
+        "unique_restaurantIds",
+        "unique_branchIds",
+        "branch_ids",
+        "branch_names",
+        "branches",
+        "entity_key",
+        "entity_type",
+        "franchise",
+        "normalized_name",
+    ]
+    present = [c for c in detail_cols if c in per_entity.columns]
+    detail = per_entity[present].copy()
     return {
         "explanation": explanation,
-        "branches_per_restaurant": per_entity.copy(),
+        "branches_per_restaurant": detail,
         "branch_count_distribution": dist,
     }
 
@@ -408,11 +718,11 @@ def answer_q5(per_entity: pd.DataFrame, df: pd.DataFrame) -> dict[str, Any]:
         "question_number": 5,
         "question": "متوسط الفروع لكل مطعم / Average branches per restaurant",
         "explanation": (
-            "Primary average uses brand-aware restaurant entities (special franchises collapsed). "
-            "A secondary average uses raw restaurantId only, which inflates McDonald's/McCafe/Starbucks "
-            "because each of their branches has a unique restaurantId."
+            "Primary average uses name-based restaurant entities (actual unique). "
+            "A secondary average uses raw restaurantId only, which inflates brands that assign a "
+            "different restaurantId per branch (McDonald's/McCafe/Starbucks and others)."
         ),
-        "methodology": "mean(branch_count) over entity table from Q3; also mean over restaurantId groups.",
+        "methodology": "mean(branch_count) over name-based entity table from Q3; also mean over restaurantId groups.",
         "answer": {
             "avg_branches_per_restaurant_entity": round(avg_entities, 4),
             "avg_branches_per_restaurantId_raw": round(avg_by_rid, 4),
@@ -435,14 +745,33 @@ def sheet_q4(per_entity: pd.DataFrame) -> dict[str, pd.DataFrame]:
                 "question": "المطاعم متعددة الفروع / Multi-branch restaurants",
                 "explanation": (
                     "Lists restaurant entities with more than one branchId. "
-                    "Special franchises appear as one row each (McDonald's, McCafe, Starbucks) "
-                    "even when every branch has a different restaurantId."
+                    "Same schema as Q3: restaurant_ids / restaurant_names / branch_ids / "
+                    "branch_names / branches are JSON arrays with the full multi-id detail."
                 ),
                 "row_count": int(len(multi)),
             }
         ]
     )
-    return {"explanation": explanation, "multi_branch_restaurants": multi}
+    detail_cols = [
+        "restaurant_name",
+        "restaurant_ids",
+        "restaurant_names",
+        "branch_count",
+        "unique_restaurantIds",
+        "unique_branchIds",
+        "branch_ids",
+        "branch_names",
+        "branches",
+        "entity_key",
+        "entity_type",
+        "franchise",
+        "normalized_name",
+    ]
+    present = [c for c in detail_cols if c in multi.columns]
+    return {
+        "explanation": explanation,
+        "multi_branch_restaurants": multi[present].copy() if present else multi,
+    }
 
 
 def sheet_q6(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -465,7 +794,7 @@ def sheet_q6(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
                 "explanation": (
                     "Grouped by numeric shopCity. Labels are inferred from dominant Kuwait areas "
                     "(Capital, Hawalli, Farwaniya, Ahmadi, Jahra, Mubarak Al-Kabeer). "
-                    "unique_restaurant_entities uses brand-aware keys for special franchises."
+                    "unique_restaurant_entities uses normalized restaurant name (actual unique)."
                 ),
             }
         ]
@@ -574,8 +903,9 @@ def sheet_q8(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
                 "question_number": 8,
                 "question": "كثافة المطاعم حسب المنطقة / Restaurant density by area",
                 "explanation": (
-                    "Density is unique restaurant entities per approximate km^2 of the area's "
-                    "geo-validated coordinates. Coordinates outside Kuwait bounds or farther than "
+                    "Density is unique restaurant entities (normalized name / actual unique) per "
+                    "approximate km^2 of the area's geo-validated coordinates. Coordinates outside "
+                    "Kuwait bounds or farther than "
                     f"{COORD_OUTLIER_KM} km from the area median lat/lon are flagged as likely wrong "
                     "and excluded from coverage/density math. shopArea names from R2 shoparea_and_id.xlsx."
                 ),
@@ -770,9 +1100,9 @@ def sheet_q11(df: pd.DataFrame, per_entity: pd.DataFrame) -> dict[str, pd.DataFr
                 "question_number": 11,
                 "question": "نسبة المطاعم مقابل الفروع / Restaurants vs branches ratio",
                 "explanation": (
-                    "Compares brand-aware restaurant entities to unique branchIds. "
+                    "Compares name-based restaurant entities (actual unique) to unique branchIds. "
                     "branches_per_restaurant_entity > 1 means the average entity has multiple branches. "
-                    "Also includes the raw restaurantId count for contrast with special franchises."
+                    "Also includes the raw restaurantId count for contrast."
                 ),
             }
         ]
@@ -881,6 +1211,8 @@ def main() -> int:
     write_json(out / "q02_total_branches.json", q2)
     write_json(out / "q05_avg_branches_per_restaurant.json", q5)
 
+    write_excel(out / "q01_total_restaurants.xlsx", sheet_q1(df, per_entity, q1))
+    write_excel(out / "q02_total_branches.xlsx", sheet_q2(df, q2))
     write_excel(out / "q03_branches_per_restaurant.xlsx", sheet_q3(per_entity))
     write_excel(out / "q04_multi_branch_restaurants.xlsx", sheet_q4(per_entity))
     write_excel(out / "q06_restaurants_by_city.xlsx", sheet_q6(df))
@@ -905,6 +1237,8 @@ def main() -> int:
                 "q05_avg_branches_per_restaurant.json",
             ],
             "excel": [
+                "q01_total_restaurants.xlsx",
+                "q02_total_branches.xlsx",
                 "q03_branches_per_restaurant.xlsx",
                 "q04_multi_branch_restaurants.xlsx",
                 "q06_restaurants_by_city.xlsx",
