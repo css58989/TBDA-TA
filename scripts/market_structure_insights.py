@@ -321,6 +321,38 @@ def write_excel(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
     print(f"Wrote {path}")
 
 
+def _json_list(values: list[Any]) -> str:
+    """Serialize a Python list for Excel cells (JSON array)."""
+    return json.dumps(values, ensure_ascii=False)
+
+
+def _sorted_unique_ids(series: pd.Series) -> list[Any]:
+    ids: list[Any] = []
+    seen: set[Any] = set()
+    for value in series.dropna().tolist():
+        try:
+            key: Any = int(value)
+        except (TypeError, ValueError):
+            key = value
+        if key in seen:
+            continue
+        seen.add(key)
+        ids.append(key)
+    return sorted(ids, key=lambda x: (str(type(x)), str(x)))
+
+
+def _sorted_unique_texts(series: pd.Series) -> list[str]:
+    texts: list[str] = []
+    seen: set[str] = set()
+    for value in series.dropna().tolist():
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        texts.append(text)
+    return sorted(texts, key=str.lower)
+
+
 def _display_name_for_group(g: pd.DataFrame, franchise: Optional[str]) -> str:
     if franchise:
         return franchise
@@ -351,7 +383,8 @@ def answer_q1(df: pd.DataFrame) -> dict[str, Any]:
     # Brands where one normalized name spans multiple restaurantIds (same problem as McCafe).
     multi_rows = []
     for entity_key, g in df.groupby("entity_key", dropna=False):
-        n_ids = int(g["restaurantId"].nunique())
+        restaurant_ids = _sorted_unique_ids(g["restaurantId"])
+        n_ids = len(restaurant_ids)
         if n_ids <= 1:
             continue
         franchise = (
@@ -359,10 +392,14 @@ def answer_q1(df: pd.DataFrame) -> dict[str, Any]:
             if g["special_franchise"].notna().any()
             else None
         )
+        restaurant_names = _sorted_unique_texts(g["name"])
         multi_rows.append(
             {
                 "entity_key": entity_key,
                 "display_name": _display_name_for_group(g, franchise),
+                "restaurant_name": _display_name_for_group(g, franchise),
+                "restaurant_ids": _json_list(restaurant_ids),
+                "restaurant_names": _json_list(restaurant_names),
                 "branches": int(g["branchId"].nunique()),
                 "unique_restaurantIds": n_ids,
             }
@@ -394,7 +431,8 @@ def answer_q1(df: pd.DataFrame) -> dict[str, Any]:
             "difference_id_vs_name_entities": unique_by_id - unique_entities,
             "brands_with_multiple_restaurantIds": int(len(name_multi_id)),
             "special_franchises": special.to_dict(orient="records"),
-            "top_multi_id_brands": name_multi_id.head(40).to_dict(orient="records"),
+            # Full list (not top-N) — used by Excel sheet multi_id_brands.
+            "multi_id_brands": name_multi_id.to_dict(orient="records"),
             "unique_branches_context": int(df["branchId"].nunique()),
         },
         "generated_at": utc_now(),
@@ -525,7 +563,7 @@ def sheet_q1(df: pd.DataFrame, per_entity: pd.DataFrame, q1: dict[str, Any]) -> 
     by_id = _restaurants_by_id_sheet(df)
     actual = _restaurants_actual_unique_sheet(per_entity)
     special = pd.DataFrame(ans.get("special_franchises") or [])
-    multi = pd.DataFrame(ans.get("top_multi_id_brands") or [])
+    multi = pd.DataFrame(ans.get("multi_id_brands") or [])
     return {
         "explanation": explanation,
         "restaurants_by_id": by_id,
@@ -554,38 +592,6 @@ def sheet_q2(df: pd.DataFrame, q2: dict[str, Any]) -> dict[str, pd.DataFrame]:
         "explanation": explanation,
         "branches": branches,
     }
-
-
-def _json_list(values: list[Any]) -> str:
-    """Serialize a Python list for Excel cells (JSON array)."""
-    return json.dumps(values, ensure_ascii=False)
-
-
-def _sorted_unique_ids(series: pd.Series) -> list[Any]:
-    ids: list[Any] = []
-    seen: set[Any] = set()
-    for value in series.dropna().tolist():
-        try:
-            key: Any = int(value)
-        except (TypeError, ValueError):
-            key = value
-        if key in seen:
-            continue
-        seen.add(key)
-        ids.append(key)
-    return sorted(ids, key=lambda x: (str(type(x)), str(x)))
-
-
-def _sorted_unique_texts(series: pd.Series) -> list[str]:
-    texts: list[str] = []
-    seen: set[str] = set()
-    for value in series.dropna().tolist():
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        texts.append(text)
-    return sorted(texts, key=str.lower)
 
 
 def branches_per_entity(df: pd.DataFrame) -> pd.DataFrame:
