@@ -9,13 +9,17 @@ In R2 mode, also loads shoparea_and_id.xlsx from the same day prefix:
 Writes per-question files under --out-dir (uploaded as a GitHub Actions artifact in CI):
   - JSON with explanation for Q1, Q2, Q5
   - Excel for Q1-Q4, Q6-Q11 (Q1/Q2 include id+name listing sheets)
+  - q01_total_restaurants_big_picture.xlsx: same as Q1 plus menuUrl, logo,
+    verticalType, isGrocery, restaurantSlug, branchName, shopArea, cuisineString
 
 Restaurant entity keys (used for actual_unique across all questions):
   - unique_by_restaurant_id = distinct restaurantId
-  - actual_unique_restaurant_entities = distinct normalized restaurant name
-    (area suffixes stripped, e.g. "Asha's, Jabriya" -> "asha's"), with
-    McDonald's / McCafe / Starbucks forced to one brand key each when the
-    name does not use a clean comma pattern.
+  - actual_unique_restaurant_entities = distinct restaurants after merging by
+    compact normalized name (spaces/punctuation/parenthetical locations removed)
+    AND by shared restaurantId (union-find). Examples that become one entity:
+    Al Gedawy/Algedawy, Fatayer Al Sham/Fatayer AlSham, Sakura (mall variants),
+    Bukhari Al Uzbaki/Bukhari Ozbaki. McDonald's / McCafe / Starbucks forced
+    to one brand key each.
 """
 
 from __future__ import annotations
@@ -84,10 +88,9 @@ def utc_now() -> str:
 
 
 _APOSTROPHE_RE = re.compile(r"[\u2018\u2019\u02bc`´]")
-_PAREN_SUFFIX_RE = re.compile(
-    r"\s*\((?:DH\s*Kitchen|TGO|Talabat\s*GO)[^)]*\)\s*",
-    flags=re.IGNORECASE,
-)
+# Any parenthetical is treated as branch/location metadata for brand matching
+# (DH Kitchen, TGO, "360 Mall", "holiday inn Salmiya", "Lake Mall", etc.).
+_PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*")
 # Text after " - " that looks like a branch/location (not part of the brand name).
 _BRANCH_LOCATION_HINTS: tuple[str, ...] = (
     "mall",
@@ -136,7 +139,10 @@ _BRANCH_LOCATION_HINTS: tuple[str, ...] = (
 def _clean_text(value: object) -> Optional[str]:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return None
-    text = _APOSTROPHE_RE.sub("'", str(value)).strip()
+    # NBSP / other unicode spaces often appear in Talabat names (e.g. Bukhari\xa0Al\xa0Uzbaki).
+    text = str(value).replace("\xa0", " ").replace("\u2009", " ").replace("\u202f", " ")
+    text = _APOSTROPHE_RE.sub("'", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text or None
 
 
@@ -161,6 +167,12 @@ def _looks_like_branch_location_suffix(suffix: str) -> bool:
     return any(hint in s for hint in _BRANCH_LOCATION_HINTS)
 
 
+_TRAILING_CHANNEL_RE = re.compile(
+    r"[\s\-_]+(?:tgo|tmp|talabat\s*go|dh\s*kitchen)\s*$",
+    flags=re.IGNORECASE,
+)
+
+
 def brand_core_from_clean_text(text: str) -> str:
     """Extract brand label from a cleaned restaurant/branch name string."""
     text = _PAREN_SUFFIX_RE.sub(" ", text)
@@ -169,6 +181,8 @@ def brand_core_from_clean_text(text: str) -> str:
         left, right = core.split(" - ", 1)
         if _looks_like_branch_location_suffix(right):
             core = left.strip()
+    # "Cookie Dough TGO" / "Kalha ... TGO" channel tags on the brand itself
+    core = _TRAILING_CHANNEL_RE.sub("", core)
     core = re.sub(r"\s+", " ", core).strip(" -_")
     return core
 
@@ -177,10 +191,14 @@ def normalize_restaurant_name(name: object) -> Optional[str]:
     """
     Brand-level name used for actual_unique entities.
 
-    Strips delivery-area / branch location suffixes so that
-    "CocoaVia, Hawally", "Asha's, Jabriya", "Shake Shack - 360 Mall, Zahra",
-    and "BURGER BOUTIQUE" collapse to one restaurant each when they share a
-    brand name across restaurantIds.
+    Strips delivery-area / branch location suffixes and compactifies spacing so
+    that these count as one restaurant even with different restaurantIds:
+      - "CocoaVia, Hawally" / "Asha's, Jabriya"
+      - "Shake Shack - 360 Mall, Zahra"
+      - "Sakura (360 Mall)" / "Sakura (crowne plaza)"
+      - "Achar Chefna (Lake Mall)" / "Achar Chefna"
+      - "Al Gedawy" / "Algedawy"
+      - "Fatayer Al Sham" / "Fatayer AlSham"
     """
     text = _clean_text(name)
     if text is None:
@@ -188,13 +206,17 @@ def normalize_restaurant_name(name: object) -> Optional[str]:
     core = brand_core_from_clean_text(text)
     if not core:
         return None
-    return core.lower()
+    core = core.lower()
+    # Drop punctuation / separators; keep letters+digits only so spacing
+    # variants collapse: "al gedawy" == "algedawy", "al sham" == "alsham".
+    core = re.sub(r"[^a-z0-9]+", "", core)
+    return core or None
 
 
 def restaurant_entity_key(row: dict[str, Any]) -> str:
     """
-    Actual unique restaurant entity: prefer special franchise brand, else
-    normalized name, else restaurantId fallback.
+    Provisional entity key for one row (before ID/name union-find merge).
+    Prefer special franchise brand, else normalized name, else restaurantId.
     """
     brand = row.get("special_franchise")
     if brand:
@@ -204,6 +226,82 @@ def restaurant_entity_key(row: dict[str, Any]) -> str:
         return f"name:{norm}"
     rid = row.get("restaurantId")
     return f"restaurantId:{rid}"
+
+
+class _UnionFind:
+    def __init__(self) -> None:
+        self.parent: dict[Any, Any] = {}
+
+    def add(self, x: Any) -> None:
+        if x not in self.parent:
+            self.parent[x] = x
+
+    def find(self, x: Any) -> Any:
+        self.add(x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: Any, b: Any) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+def assign_merged_entity_keys(rows: list[dict[str, Any]]) -> None:
+    """
+    Merge actual-unique entities when they share restaurantId OR normalized name.
+
+    Example: restaurantId 8050 appears as both "Bukhari Al Uzbaki" and
+    "Bukhari Ozbaki" -> one entity. Same for Cookie Dough / Cookie Dough TGO.
+    """
+    uf = _UnionFind()
+    provisional: list[str] = []
+    for row in rows:
+        key = restaurant_entity_key(row)
+        provisional.append(key)
+        uf.add(key)
+
+    # Union all provisional keys that share a restaurantId.
+    by_rid: dict[Any, list[str]] = defaultdict(list)
+    for row, key in zip(rows, provisional):
+        rid = row.get("restaurantId")
+        if rid is None or (isinstance(rid, float) and math.isnan(rid)):
+            continue
+        by_rid[rid].append(key)
+    for keys in by_rid.values():
+        first = keys[0]
+        for other in keys[1:]:
+            uf.union(first, other)
+
+    # Canonical label per component: prefer special-franchise / shortest common name.
+    root_labels: dict[Any, str] = {}
+    root_name_counts: dict[Any, Counter] = defaultdict(Counter)
+    for row, key in zip(rows, provisional):
+        root = uf.find(key)
+        brand = row.get("special_franchise")
+        if brand:
+            root_labels[root] = f"name:{str(brand).lower()}"
+            continue
+        norm = row.get("normalized_name") or normalize_restaurant_name(row.get("name"))
+        if norm:
+            root_name_counts[root][norm] += 1
+
+    for root, counts in root_name_counts.items():
+        if root in root_labels:
+            continue
+        # Most frequent normalized name; tie-break shorter then alpha.
+        best = sorted(counts.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))[0][0]
+        root_labels[root] = f"name:{best}"
+
+    for row, key in zip(rows, provisional):
+        root = uf.find(key)
+        if root in root_labels:
+            row["entity_key"] = root_labels[root]
+        else:
+            rid = row.get("restaurantId")
+            row["entity_key"] = f"restaurantId:{rid}"
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -343,6 +441,12 @@ def build_branch_frame(records: list[dict], area_map: dict[int, str]) -> pd.Data
             lat_f, lon_f = None, None
 
         norm_name = normalize_restaurant_name(item.get("name"))
+        is_grocery = item.get("isGrocery")
+        if isinstance(is_grocery, str):
+            is_grocery = is_grocery.strip().lower() in {"1", "true", "yes"}
+        elif is_grocery is not None:
+            is_grocery = bool(is_grocery)
+
         by_branch[bid] = {
             "branchId": bid,
             "restaurantId": item.get("restaurantId"),
@@ -358,14 +462,17 @@ def build_branch_frame(records: list[dict], area_map: dict[int, str]) -> pd.Data
             "cuisineString": item.get("cuisineString") or "",
             "verticalType": vertical,
             "verticalType_name": VERTICAL_TYPE_NAMES.get(vertical, f"verticalType_{vertical}"),
+            "menuUrl": item.get("menuUrl"),
+            "logo": item.get("logo"),
+            "isGrocery": is_grocery,
+            "restaurantSlug": item.get("restaurantSlug"),
             "special_franchise": brand,
             "entity_key": None,
             "_source_file": item.get("_source_file"),
         }
 
     rows = list(by_branch.values())
-    for row in rows:
-        row["entity_key"] = restaurant_entity_key(row)
+    assign_merged_entity_keys(rows)
     return pd.DataFrame(rows)
 
 
@@ -483,16 +590,20 @@ def answer_q1(df: pd.DataFrame) -> dict[str, Any]:
         "question": "عدد المطاعم الكلي / Total restaurants",
         "explanation": (
             "Two totals are reported. unique_by_restaurant_id counts distinct restaurantId values. "
-            "actual_unique_restaurant_entities counts distinct restaurants by normalized name "
-            "(and id only as fallback when name is missing): location suffixes after a comma are "
-            "stripped so Asha's / CocoaVia / Burger Boutique / McDonald's / McCafe / Starbucks "
-            "and similar brands count as one restaurant even when each branch has its own restaurantId."
+            "actual_unique_restaurant_entities counts distinct restaurants after name normalization "
+            "plus merging any rows that share the same restaurantId (so Bukhari Al Uzbaki / "
+            "Bukhari Ozbaki, Cookie Dough / Cookie Dough TGO, Kalha variants, etc. are one "
+            "restaurant). Location suffixes and TGO/TMP tags are stripped from names; "
+            "McDonald's / McCafe / Starbucks stay one brand each."
         ),
         "methodology": (
             "Deduplicate rows by branchId across delivery-area files. "
-            "entity_key = special franchise brand (McDonald's/McCafe/Starbucks) when detected, "
-            "else normalize(name) (apostrophes unified, DH Kitchen/TGO parentheticals removed, "
-            "text before first comma kept, lowercased), else restaurantId."
+            "Provisional entity_key = special franchise brand when detected, else normalize(name) "
+            "(apostrophes/spaces unified, all parentheticals removed, comma/' - ' location "
+            "suffixes and TGO/TMP tags stripped, then non-alphanumerics removed so "
+            "'Al Gedawy'=='Algedawy' and 'Fatayer Al Sham'=='Fatayer AlSham'), else restaurantId. "
+            "Then union-find merges entities that share the same restaurantId or the same "
+            "normalized name (e.g. Bukhari Al Uzbaki / Bukhari Ozbaki, Sakura mall variants)."
         ),
         "answer": {
             "unique_by_restaurant_id": unique_by_id,
@@ -528,7 +639,65 @@ def answer_q2(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def _restaurants_by_id_sheet(df: pd.DataFrame) -> pd.DataFrame:
+BIG_PICTURE_ATTRS: tuple[str, ...] = (
+    "menuUrl",
+    "logo",
+    "verticalType",
+    "isGrocery",
+    "restaurantSlug",
+    "branchName",
+    "shopArea",
+    "cuisineString",
+)
+
+
+def _mode_or_none(series: pd.Series) -> Any:
+    s = series.dropna()
+    if s.empty:
+        return None
+    return s.mode().iloc[0]
+
+
+def _big_picture_from_group(g: pd.DataFrame) -> dict[str, Any]:
+    """Representative + list columns for big-picture attributes on a branch group."""
+    out: dict[str, Any] = {}
+    for col in BIG_PICTURE_ATTRS:
+        list_col = f"{col}_list"
+        if col not in g.columns:
+            out[col] = None
+            out[list_col] = _json_list([])
+            continue
+        series = g[col]
+        if col in {"verticalType", "shopArea"}:
+            values = _sorted_unique_ids(series)
+            out[col] = values[0] if values else None
+            out[list_col] = _json_list(values)
+        elif col == "isGrocery":
+            bools: list[bool] = []
+            for v in series.dropna().tolist():
+                b = bool(v)
+                if b not in bools:
+                    bools.append(b)
+            if not bools:
+                out[col] = None
+            elif len(bools) == 1:
+                out[col] = bools[0]
+            else:
+                # Mixed within entity: prefer True if any grocery branch exists.
+                out[col] = True
+            out[list_col] = _json_list(bools)
+        else:
+            values = _sorted_unique_texts(series)
+            mode_val = _mode_or_none(series)
+            if mode_val is not None and str(mode_val).strip() and str(mode_val).lower() != "nan":
+                out[col] = str(mode_val).strip()
+            else:
+                out[col] = values[0] if values else None
+            out[list_col] = _json_list(values)
+    return out
+
+
+def _restaurants_by_id_sheet(df: pd.DataFrame, *, big_picture: bool = False) -> pd.DataFrame:
     """One row per restaurantId with id + name."""
     rows = []
     for rid, g in df.groupby("restaurantId", dropna=False):
@@ -538,25 +707,31 @@ def _restaurants_by_id_sheet(df: pd.DataFrame) -> pd.DataFrame:
             if g["special_franchise"].notna().any()
             else None
         )
-        rows.append(
-            {
-                "restaurantId": rid,
-                "name": name,
-                "normalized_name": g["normalized_name"].dropna().iloc[0]
-                if g["normalized_name"].notna().any()
-                else None,
-                "entity_key": g["entity_key"].iloc[0],
-                "display_name": _display_name_for_group(g, franchise),
-                "branch_count": int(g["branchId"].nunique()),
-            }
-        )
+        row = {
+            "restaurantId": rid,
+            "name": name,
+            "normalized_name": g["normalized_name"].dropna().iloc[0]
+            if g["normalized_name"].notna().any()
+            else None,
+            "entity_key": g["entity_key"].iloc[0],
+            "display_name": _display_name_for_group(g, franchise),
+            "branch_count": int(g["branchId"].nunique()),
+        }
+        if big_picture:
+            row.update(_big_picture_from_group(g))
+        rows.append(row)
     out = pd.DataFrame(rows)
     if out.empty:
         return out
     return out.sort_values(["name", "restaurantId"], ascending=[True, True]).reset_index(drop=True)
 
 
-def _restaurants_actual_unique_sheet(per_entity: pd.DataFrame) -> pd.DataFrame:
+def _restaurants_actual_unique_sheet(
+    per_entity: pd.DataFrame,
+    df: Optional[pd.DataFrame] = None,
+    *,
+    big_picture: bool = False,
+) -> pd.DataFrame:
     """One row per actual-unique restaurant entity (normalized name) with id(s) + name."""
     if per_entity.empty:
         return pd.DataFrame(
@@ -585,12 +760,40 @@ def _restaurants_actual_unique_sheet(per_entity: pd.DataFrame) -> pd.DataFrame:
     ]
     present = [c for c in cols if c in per_entity.columns]
     out = per_entity[present].copy()
+    if big_picture and df is not None and "entity_key" in df.columns:
+        bp_rows = []
+        for entity_key, g in df.groupby("entity_key", dropna=False):
+            row = {"entity_key": entity_key}
+            row.update(_big_picture_from_group(g))
+            bp_rows.append(row)
+        bp = pd.DataFrame(bp_rows)
+        out = out.merge(bp, on="entity_key", how="left")
     return out.sort_values(
         ["restaurant_name", "entity_key"], ascending=[True, True]
     ).reset_index(drop=True)
 
 
-def _branches_sheet(df: pd.DataFrame) -> pd.DataFrame:
+def _multi_id_brands_sheet(
+    multi: pd.DataFrame,
+    df: Optional[pd.DataFrame] = None,
+    *,
+    big_picture: bool = False,
+) -> pd.DataFrame:
+    if multi is None or multi.empty:
+        return pd.DataFrame(columns=["entity_key"])
+    out = multi.copy()
+    if big_picture and df is not None and "entity_key" in out.columns:
+        bp_rows = []
+        for entity_key, g in df.groupby("entity_key", dropna=False):
+            row = {"entity_key": entity_key}
+            row.update(_big_picture_from_group(g))
+            bp_rows.append(row)
+        bp = pd.DataFrame(bp_rows)
+        out = out.merge(bp, on="entity_key", how="left")
+    return out
+
+
+def _branches_sheet(df: pd.DataFrame, *, big_picture: bool = False) -> pd.DataFrame:
     """One row per unique branchId with id + name."""
     cols = [
         "branchId",
@@ -605,13 +808,40 @@ def _branches_sheet(df: pd.DataFrame) -> pd.DataFrame:
         "shopArea",
         "shopArea_name",
     ]
+    if big_picture:
+        cols = [
+            "branchId",
+            "branchName",
+            "name",
+            "restaurantId",
+            "normalized_name",
+            "entity_key",
+            "special_franchise",
+            "menuUrl",
+            "logo",
+            "verticalType",
+            "verticalType_name",
+            "isGrocery",
+            "restaurantSlug",
+            "shopCity",
+            "shopCity_label",
+            "shopArea",
+            "shopArea_name",
+            "cuisineString",
+        ]
     present = [c for c in cols if c in df.columns]
     out = df[present].drop_duplicates(subset=["branchId"]).copy()
     out = out.rename(columns={"name": "restaurant_name"})
     return out.sort_values(["branchName", "branchId"], ascending=[True, True]).reset_index(drop=True)
 
 
-def sheet_q1(df: pd.DataFrame, per_entity: pd.DataFrame, q1: dict[str, Any]) -> dict[str, pd.DataFrame]:
+def sheet_q1(
+    df: pd.DataFrame,
+    per_entity: pd.DataFrame,
+    q1: dict[str, Any],
+    *,
+    big_picture: bool = False,
+) -> dict[str, pd.DataFrame]:
     ans = q1["answer"]
     explanation = pd.DataFrame(
         [
@@ -626,20 +856,29 @@ def sheet_q1(df: pd.DataFrame, per_entity: pd.DataFrame, q1: dict[str, Any]) -> 
                 "brands_with_multiple_restaurantIds": ans["brands_with_multiple_restaurantIds"],
                 "unique_branches_context": ans["unique_branches_context"],
                 "generated_at": q1["generated_at"],
+                "variant": "big_picture" if big_picture else "standard",
+                "big_picture_columns": ", ".join(BIG_PICTURE_ATTRS) if big_picture else "",
             }
         ]
     )
-    by_id = _restaurants_by_id_sheet(df)
-    actual = _restaurants_actual_unique_sheet(per_entity)
+    by_id = _restaurants_by_id_sheet(df, big_picture=big_picture)
+    actual = _restaurants_actual_unique_sheet(per_entity, df, big_picture=big_picture)
     special = pd.DataFrame(ans.get("special_franchises") or [])
-    multi = pd.DataFrame(ans.get("multi_id_brands") or [])
-    return {
+    multi = _multi_id_brands_sheet(
+        pd.DataFrame(ans.get("multi_id_brands") or []),
+        df,
+        big_picture=big_picture,
+    )
+    sheets = {
         "explanation": explanation,
         "restaurants_by_id": by_id,
         "restaurants_actual_unique": actual,
         "special_franchises": special if len(special) else pd.DataFrame(columns=["special_franchise"]),
         "multi_id_brands": multi if len(multi) else pd.DataFrame(columns=["entity_key"]),
     }
+    if big_picture:
+        sheets["branches"] = _branches_sheet(df, big_picture=True)
+    return sheets
 
 
 def sheet_q2(df: pd.DataFrame, q2: dict[str, Any]) -> dict[str, pd.DataFrame]:
@@ -1287,6 +1526,10 @@ def main() -> int:
     write_json(out / "q05_avg_branches_per_restaurant.json", q5)
 
     write_excel(out / "q01_total_restaurants.xlsx", sheet_q1(df, per_entity, q1))
+    write_excel(
+        out / "q01_total_restaurants_big_picture.xlsx",
+        sheet_q1(df, per_entity, q1, big_picture=True),
+    )
     write_excel(out / "q02_total_branches.xlsx", sheet_q2(df, q2))
     write_excel(out / "q03_branches_per_restaurant.xlsx", sheet_q3(per_entity))
     write_excel(out / "q04_multi_branch_restaurants.xlsx", sheet_q4(per_entity))
@@ -1313,6 +1556,7 @@ def main() -> int:
             ],
             "excel": [
                 "q01_total_restaurants.xlsx",
+                "q01_total_restaurants_big_picture.xlsx",
                 "q02_total_branches.xlsx",
                 "q03_branches_per_restaurant.xlsx",
                 "q04_multi_branch_restaurants.xlsx",
