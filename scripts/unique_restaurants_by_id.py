@@ -9,9 +9,11 @@ In CI the out-dir is uploaded as a GitHub Actions artifact only
 (not committed to the repo, not written back to R2).
 
 Columns:
-  id, name, restaurantSlug, branchId, branchName, branchSlug,
-  cuisineString, shopArea, shopCity, isGrocery, verticalType,
+  id, name, logo, restaurantSlug, branchId, branchName, branchSlug,
+  cuisineString, shopArea, area_name, shopCity, isGrocery, verticalType,
   shopType, isDarkstore
+
+`area_name` comes from shoparea_and_id.xlsx by matching shopArea -> area_id.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 
@@ -37,15 +40,19 @@ from src.restaurant_io import (  # noqa: E402
     make_r2_client,
 )
 
+DEFAULT_AREA_MAP_FILENAME = "shoparea_and_id.xlsx"
+
 COLUMNS: list[str] = [
     "id",
     "name",
+    "logo",
     "restaurantSlug",
     "branchId",
     "branchName",
     "branchSlug",
     "cuisineString",
     "shopArea",
+    "area_name",
     "shopCity",
     "isGrocery",
     "verticalType",
@@ -64,6 +71,64 @@ def resolve_restaurant_id(item: dict[str, Any]) -> Any:
     if rid is None or rid == "":
         rid = item.get("restaurantId")
     return rid
+
+
+def area_map_key_under_prefix(prefix: str, filename: str = DEFAULT_AREA_MAP_FILENAME) -> str:
+    prefix = (prefix or "").strip()
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return f"{prefix}{filename}"
+
+
+def load_area_map_from_excel(source: Any, label: str) -> dict[int, str]:
+    df = pd.read_excel(source)
+    if "area_id" not in df.columns or "area_name" not in df.columns:
+        raise SystemExit(f"Expected columns area_id, area_name in {label}")
+    out: dict[int, str] = {}
+    for _, r in df.iterrows():
+        try:
+            out[int(r["area_id"])] = str(r["area_name"])
+        except (TypeError, ValueError):
+            continue
+    if not out:
+        raise SystemExit(f"No area rows loaded from {label}")
+    print(f"[ok] area map: {label} ({len(out)} areas)")
+    return out
+
+
+def load_area_map_local(path: Path) -> dict[int, str]:
+    if not path.exists():
+        raise SystemExit(f"Area map not found: {path}")
+    return load_area_map_from_excel(path, str(path))
+
+
+def load_area_map_r2(client, bucket: str, key: str) -> dict[int, str]:
+    from botocore.exceptions import ClientError
+
+    try:
+        obj = client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        raise SystemExit(
+            f"Area map not found in R2 at s3://{bucket}/{key}\n"
+            f"Upload shoparea_and_id.xlsx under the day prefix. Original error: {exc}"
+        ) from exc
+    return load_area_map_from_excel(BytesIO(obj["Body"].read()), f"s3://{bucket}/{key}")
+
+
+def shop_area_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def area_name_for(shop_area: Any, area_map: dict[int, str]) -> Optional[str]:
+    aid = shop_area_int(shop_area)
+    if aid is None:
+        return None
+    return area_map.get(aid)
 
 
 def load_records_local(
@@ -110,16 +175,21 @@ def load_records_r2(
     return records, sources
 
 
-def extract_row(item: dict[str, Any], restaurant_id: Any) -> dict[str, Any]:
+def extract_row(
+    item: dict[str, Any], restaurant_id: Any, area_map: dict[int, str]
+) -> dict[str, Any]:
+    shop_area = item.get("shopArea")
     return {
         "id": restaurant_id,
         "name": item.get("name"),
+        "logo": item.get("logo"),
         "restaurantSlug": item.get("restaurantSlug"),
         "branchId": item.get("branchId"),
         "branchName": item.get("branchName"),
         "branchSlug": item.get("branchSlug"),
         "cuisineString": item.get("cuisineString"),
-        "shopArea": item.get("shopArea"),
+        "shopArea": shop_area,
+        "area_name": area_name_for(shop_area, area_map),
         "shopCity": item.get("shopCity"),
         "isGrocery": item.get("isGrocery"),
         "verticalType": item.get("verticalType"),
@@ -128,12 +198,15 @@ def extract_row(item: dict[str, Any], restaurant_id: Any) -> dict[str, Any]:
     }
 
 
-def unique_by_id(records: list[dict]) -> tuple[pd.DataFrame, dict[str, Any]]:
+def unique_by_id(
+    records: list[dict], area_map: dict[int, str]
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
     Keep first-seen row per distinct restaurant `id`.
 
     Same id can appear across many delivery-area files and (for multi-branch
     brands) with different branchId values; uniqueness is id-only as requested.
+    `area_name` is joined from shoparea_and_id.xlsx via shopArea == area_id.
     """
     by_id: dict[Any, dict[str, Any]] = {}
     branch_ids_per_id: dict[Any, set[Any]] = {}
@@ -153,12 +226,19 @@ def unique_by_id(records: list[dict]) -> tuple[pd.DataFrame, dict[str, Any]]:
 
         if rid in by_id:
             continue
-        by_id[rid] = extract_row(item, rid)
+        by_id[rid] = extract_row(item, rid, area_map)
 
     rows = [by_id[k] for k in sorted(by_id.keys(), key=lambda x: (str(type(x)), x))]
     df = pd.DataFrame(rows, columns=COLUMNS)
+    df = df.sort_values(
+        by="name",
+        ascending=True,
+        kind="mergesort",
+        key=lambda s: s.astype(str).str.strip().str.casefold(),
+    ).reset_index(drop=True)
 
     multi_branch_ids = sum(1 for s in branch_ids_per_id.values() if len(s) > 1)
+    matched = int(df["area_name"].notna().sum()) if len(df) else 0
     stats = {
         "raw_rows_loaded": len(records),
         "skipped_missing_id": skipped_missing_id,
@@ -167,6 +247,9 @@ def unique_by_id(records: list[dict]) -> tuple[pd.DataFrame, dict[str, Any]]:
         "unique_branchIds_seen_across_raw": int(
             len({b for s in branch_ids_per_id.values() for b in s})
         ),
+        "area_name_matched": matched,
+        "area_name_unmatched": int(len(df) - matched),
+        "area_map_size": len(area_map),
     }
     return df, stats
 
@@ -192,6 +275,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-files", type=int, default=None)
     p.add_argument(
+        "--area-map",
+        type=Path,
+        default=None,
+        help="Local Excel mapping area_id -> area_name (local mode; optional auto-detect)",
+    )
+    p.add_argument(
+        "--area-map-key",
+        default=os.environ.get("AREA_MAP_R2_KEY", ""),
+        help="R2 object key for shoparea_and_id.xlsx. Default: <prefix>/shoparea_and_id.xlsx",
+    )
+    p.add_argument(
         "--out-dir",
         type=Path,
         default=ROOT / "outputs" / "unique_restaurants_by_id",
@@ -202,6 +296,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    area_map_source = ""
 
     if args.mode == "local":
         local_dir = args.local_dir
@@ -210,11 +305,32 @@ def main() -> int:
             local_dir = candidate if candidate.exists() else ROOT / "sample_data"
         if not local_dir.exists():
             raise SystemExit(f"Local directory not found: {local_dir}")
+
+        area_path = args.area_map
+        if area_path is None:
+            for candidate in (
+                local_dir / DEFAULT_AREA_MAP_FILENAME,
+                ROOT / "data" / DEFAULT_AREA_MAP_FILENAME,
+                ROOT.parent / DEFAULT_AREA_MAP_FILENAME,
+            ):
+                if candidate.exists():
+                    area_path = candidate
+                    break
+        if area_path is None:
+            raise SystemExit(
+                f"Area map not found. Place {DEFAULT_AREA_MAP_FILENAME} next to local JSON "
+                "or pass --area-map"
+            )
+        area_map = load_area_map_local(area_path)
+        area_map_source = str(area_path)
         records, sources = load_records_local(local_dir, args.key_contains, args.max_files)
         mode = "local"
     else:
         bucket = clean_env("CF_R2_BUCKET_NAME")
         client = make_r2_client(bucket=bucket)
+        area_key = (args.area_map_key or "").strip() or area_map_key_under_prefix(args.prefix)
+        area_map = load_area_map_r2(client, bucket, area_key)
+        area_map_source = f"s3://{bucket}/{area_key}"
         records, sources = load_records_r2(
             client, bucket, args.prefix, args.key_contains, args.max_files
         )
@@ -223,7 +339,7 @@ def main() -> int:
     if not records:
         raise SystemExit("No restaurant records loaded")
 
-    df, stats = unique_by_id(records)
+    df, stats = unique_by_id(records, area_map)
     out = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
 
@@ -237,7 +353,8 @@ def main() -> int:
                     "note": (
                         "One row per distinct restaurant `id` across all MergedRestaurantsInfo "
                         "files. Duplicate delivery-area listings and extra branches for the same "
-                        "id are collapsed; branch* / shopArea / shopCity come from the first-seen row."
+                        "id are collapsed; branch* / shopArea / shopCity come from the first-seen row. "
+                        "area_name is joined from shoparea_and_id.xlsx where shopArea == area_id."
                     )
                 }
             ]
@@ -250,6 +367,7 @@ def main() -> int:
         "columns": COLUMNS,
         "source_files": sources,
         "source_file_count": len(sources),
+        "area_map_source": area_map_source,
         **stats,
         "outputs": {
             "excel": excel_name,
@@ -264,6 +382,7 @@ def main() -> int:
     print("")
     print(
         f"Done: unique_ids={stats['unique_restaurant_ids']}, "
+        f"area_name_matched={stats['area_name_matched']}, "
         f"raw_rows={stats['raw_rows_loaded']}, files={len(sources)}"
     )
     print(f"Excel: {excel_path}")
