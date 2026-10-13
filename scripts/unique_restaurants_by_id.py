@@ -13,6 +13,8 @@ Columns:
   cuisineString, shopArea, area_name, shopCity, isGrocery, verticalType,
   shopType, isDarkstore
 
+`branchId` / `branchName` / `branchSlug` are JSON lists of all distinct branches
+for that restaurant id (one or many elements). Other fields use the first-seen row.
 `area_name` comes from shoparea_and_id.xlsx by matching shopArea -> area_id.
 """
 
@@ -175,18 +177,24 @@ def load_records_r2(
     return records, sources
 
 
-def extract_row(
+BRANCH_LIST_COLUMNS: tuple[str, ...] = ("branchId", "branchName", "branchSlug")
+
+
+def format_list_for_excel(values: list[Any]) -> str:
+    """Always a JSON list string (one or many elements) so Excel keeps full branch info."""
+    return json.dumps(values, ensure_ascii=False)
+
+
+def extract_restaurant_fields(
     item: dict[str, Any], restaurant_id: Any, area_map: dict[int, str]
 ) -> dict[str, Any]:
+    """Restaurant-level fields (first-seen). Branch columns are filled later as lists."""
     shop_area = item.get("shopArea")
     return {
         "id": restaurant_id,
         "name": item.get("name"),
         "logo": item.get("logo"),
         "restaurantSlug": item.get("restaurantSlug"),
-        "branchId": item.get("branchId"),
-        "branchName": item.get("branchName"),
-        "branchSlug": item.get("branchSlug"),
         "cuisineString": item.get("cuisineString"),
         "shopArea": shop_area,
         "area_name": area_name_for(shop_area, area_map),
@@ -202,14 +210,15 @@ def unique_by_id(
     records: list[dict], area_map: dict[int, str]
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Keep first-seen row per distinct restaurant `id`.
+    One row per distinct restaurant `id`.
 
-    Same id can appear across many delivery-area files and (for multi-branch
-    brands) with different branchId values; uniqueness is id-only as requested.
+    `branchId` / `branchName` / `branchSlug` are lists of all distinct branches for
+    that id (deduped by branchId). Restaurant-level fields use the first-seen row.
     `area_name` is joined from shoparea_and_id.xlsx via shopArea == area_id.
     """
     by_id: dict[Any, dict[str, Any]] = {}
-    branch_ids_per_id: dict[Any, set[Any]] = {}
+    # rid -> ordered branchId -> {branchId, branchName, branchSlug}
+    branches_by_id: dict[Any, dict[Any, dict[str, Any]]] = {}
     skipped_missing_id = 0
 
     for item in records:
@@ -218,17 +227,30 @@ def unique_by_id(
             skipped_missing_id += 1
             continue
 
+        if rid not in by_id:
+            by_id[rid] = extract_restaurant_fields(item, rid, area_map)
+            branches_by_id[rid] = {}
+
         bid = item.get("branchId")
-        if rid not in branch_ids_per_id:
-            branch_ids_per_id[rid] = set()
-        if bid is not None and bid != "":
-            branch_ids_per_id[rid].add(bid)
-
-        if rid in by_id:
+        if bid is None or bid == "":
             continue
-        by_id[rid] = extract_row(item, rid, area_map)
+        if bid in branches_by_id[rid]:
+            continue
+        branches_by_id[rid][bid] = {
+            "branchId": bid,
+            "branchName": item.get("branchName"),
+            "branchSlug": item.get("branchSlug"),
+        }
 
-    rows = [by_id[k] for k in sorted(by_id.keys(), key=lambda x: (str(type(x)), x))]
+    rows: list[dict[str, Any]] = []
+    for rid in sorted(by_id.keys(), key=lambda x: (str(type(x)), x)):
+        row = dict(by_id[rid])
+        branch_rows = list(branches_by_id.get(rid, {}).values())
+        row["branchId"] = [b["branchId"] for b in branch_rows]
+        row["branchName"] = [b["branchName"] for b in branch_rows]
+        row["branchSlug"] = [b["branchSlug"] for b in branch_rows]
+        rows.append(row)
+
     df = pd.DataFrame(rows, columns=COLUMNS)
     df = df.sort_values(
         by="name",
@@ -237,21 +259,29 @@ def unique_by_id(
         key=lambda s: s.astype(str).str.strip().str.casefold(),
     ).reset_index(drop=True)
 
-    multi_branch_ids = sum(1 for s in branch_ids_per_id.values() if len(s) > 1)
+    branch_counts = df["branchId"].map(len)
+    multi_branch_ids = int((branch_counts > 1).sum()) if len(df) else 0
     matched = int(df["area_name"].notna().sum()) if len(df) else 0
     stats = {
         "raw_rows_loaded": len(records),
         "skipped_missing_id": skipped_missing_id,
         "unique_restaurant_ids": int(len(df)),
-        "ids_with_multiple_branchIds_before_dedupe": multi_branch_ids,
-        "unique_branchIds_seen_across_raw": int(
-            len({b for s in branch_ids_per_id.values() for b in s})
-        ),
+        "ids_with_multiple_branches": multi_branch_ids,
+        "unique_branchIds_across_restaurants": int(branch_counts.sum()) if len(df) else 0,
         "area_name_matched": matched,
         "area_name_unmatched": int(len(df) - matched),
         "area_map_size": len(area_map),
+        "branch_list_columns": list(BRANCH_LIST_COLUMNS),
     }
     return df, stats
+
+
+def dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """Serialize list columns to JSON strings for openpyxl (always list form)."""
+    out = df.copy()
+    for col in BRANCH_LIST_COLUMNS:
+        out[col] = out[col].map(lambda v: format_list_for_excel(list(v) if v is not None else []))
+    return out
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -345,16 +375,20 @@ def main() -> int:
 
     excel_name = "unique_restaurants_by_id.xlsx"
     excel_path = out / excel_name
+    excel_df = dataframe_for_excel(df)
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="restaurants", index=False)
+        excel_df.to_excel(writer, sheet_name="restaurants", index=False)
         pd.DataFrame(
             [
                 {
                     "note": (
                         "One row per distinct restaurant `id` across all MergedRestaurantsInfo "
-                        "files. Duplicate delivery-area listings and extra branches for the same "
-                        "id are collapsed; branch* / shopArea / shopCity come from the first-seen row. "
-                        "area_name is joined from shoparea_and_id.xlsx where shopArea == area_id."
+                        "files. branchId / branchName / branchSlug are JSON lists of every distinct "
+                        "branch for that id (always a list, even when length is 1). "
+                        "Delivery-area duplicates of the same branchId are collapsed. "
+                        "Restaurant-level fields (name, logo, shopArea, etc.) come from the "
+                        "first-seen row. area_name is joined from shoparea_and_id.xlsx where "
+                        "shopArea == area_id."
                     )
                 }
             ]
@@ -382,6 +416,8 @@ def main() -> int:
     print("")
     print(
         f"Done: unique_ids={stats['unique_restaurant_ids']}, "
+        f"multi_branch={stats['ids_with_multiple_branches']}, "
+        f"branches={stats['unique_branchIds_across_restaurants']}, "
         f"area_name_matched={stats['area_name_matched']}, "
         f"raw_rows={stats['raw_rows_loaded']}, files={len(sources)}"
     )
