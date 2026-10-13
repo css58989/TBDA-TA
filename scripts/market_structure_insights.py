@@ -249,21 +249,97 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
+_GENERIC_LOGO_STEMS = frozenset(
+    {
+        "logo",
+        "image",
+        "img",
+        "photo",
+        "pic",
+        "whatsappimage",
+        "whatsappimagea",
+        "untitled",
+        "default",
+        "placeholder",
+    }
+)
+
+
+def logo_stem_key(logo: object) -> Optional[str]:
+    """Brand-ish stem from a logo URL filename (digits / query stripped)."""
+    text = _clean_text(logo)
+    if text is None:
+        return None
+    text = text.split("?")[0]
+    match = re.search(r"/restaurants/([^/?]+)", text, flags=re.IGNORECASE)
+    fname = match.group(1) if match else text.rsplit("/", 1)[-1]
+    stem = re.sub(r"\.(jpg|jpeg|png|webp|gif)$", "", fname, flags=re.IGNORECASE).lower()
+    stem = re.sub(r"[^a-z0-9]+", "", stem)
+    stem = re.sub(r"\d+$", "", stem)
+    # "alfuhodlogo" / "arabilogo01" -> keep brand token when possible
+    stem = re.sub(r"(?:logo|logotype|icon)+$", "", stem)
+    stem = stem.strip()
+    if not stem or len(stem) < 4:
+        return None
+    if stem in _GENERIC_LOGO_STEMS or stem.startswith("whatsapp"):
+        return None
+    return stem
+
+
+def restaurant_slug_key(slug: object) -> Optional[str]:
+    text = _clean_text(slug)
+    if text is None:
+        return None
+    text = text.lower().strip(" -/_" )
+    if not text:
+        return None
+    return text
+
+
+def slug_compact_key(slug: object) -> Optional[str]:
+    key = restaurant_slug_key(slug)
+    if key is None:
+        return None
+    compact = re.sub(r"[^a-z0-9]+", "", key)
+    return compact or None
+
+
+def _compact_name_contain(a: str, b: str, *, min_len: int = 5) -> bool:
+    if not a or not b or a == b:
+        return False
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) < min_len:
+        return False
+    return shorter in longer
+
+
 def assign_merged_entity_keys(rows: list[dict[str, Any]]) -> None:
     """
-    Merge actual-unique entities when they share restaurantId OR normalized name.
-
-    Example: restaurantId 8050 appears as both "Bukhari Al Uzbaki" and
-    "Bukhari Ozbaki" -> one entity. Same for Cookie Dough / Cookie Dough TGO.
+    Merge actual-unique entities when they share:
+      - restaurantId, or
+      - normalized name, or
+      - restaurantSlug (exact or compact containment, e.g. arabi / shawarma-arabi), or
+      - brand-like logo stem + compact-name containment (e.g. AlFuhod / Alfuhod Games).
     """
     uf = _UnionFind()
     provisional: list[str] = []
     for row in rows:
+        # Attach helper keys used by brand-signal unions.
+        row["logo_stem"] = logo_stem_key(row.get("logo"))
+        row["slug_key"] = restaurant_slug_key(row.get("restaurantSlug"))
+        row["slug_compact"] = slug_compact_key(row.get("restaurantSlug"))
         key = restaurant_entity_key(row)
         provisional.append(key)
         uf.add(key)
 
-    # Union all provisional keys that share a restaurantId.
+    def _union_keys(keys: list[str]) -> None:
+        if len(keys) < 2:
+            return
+        first = keys[0]
+        for other in keys[1:]:
+            uf.union(first, other)
+
+    # 1) Same restaurantId
     by_rid: dict[Any, list[str]] = defaultdict(list)
     for row, key in zip(rows, provisional):
         rid = row.get("restaurantId")
@@ -271,9 +347,47 @@ def assign_merged_entity_keys(rows: list[dict[str, Any]]) -> None:
             continue
         by_rid[rid].append(key)
     for keys in by_rid.values():
-        first = keys[0]
-        for other in keys[1:]:
-            uf.union(first, other)
+        _union_keys(keys)
+
+    # 2) Exact restaurantSlug only (Shawarma Arabi + Arabi both slug=arabi).
+    #    Do NOT use slug prefix/containment — "arabi" would wrongly swallow "arabica".
+    by_slug: dict[str, list[str]] = defaultdict(list)
+    for row, key in zip(rows, provisional):
+        slug = row.get("slug_key")
+        if slug:
+            by_slug[slug].append(key)
+    for keys in by_slug.values():
+        _union_keys(keys)
+
+    # 3) Useful logo stem + compact name containment (AlFuhod / Alfuhod Games)
+    by_stem: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for row, key in zip(rows, provisional):
+        stem = row.get("logo_stem")
+        compact = row.get("normalized_name") or normalize_restaurant_name(row.get("name"))
+        if stem and compact:
+            by_stem[stem].append((compact, key))
+    for stem, items in by_stem.items():
+        # Also treat stem itself as a brand token for containment checks.
+        uniques: list[tuple[str, str]] = []
+        seen_ck: set[tuple[str, str]] = set()
+        for compact, key in items:
+            pair = (compact, key)
+            if pair in seen_ck:
+                continue
+            seen_ck.add(pair)
+            uniques.append((compact, key))
+        for i, (ca, ka) in enumerate(uniques):
+            for cb, kb in uniques[i + 1 :]:
+                if ka == kb:
+                    continue
+                if (
+                    _compact_name_contain(ca, cb, min_len=5)
+                    or _compact_name_contain(stem, ca, min_len=4)
+                    or _compact_name_contain(stem, cb, min_len=4)
+                    or ca == stem
+                    or cb == stem
+                ):
+                    uf.union(ka, kb)
 
     # Canonical label per component: prefer special-franchise / shortest common name.
     root_labels: dict[Any, str] = {}
