@@ -10,10 +10,10 @@ In CI the out-dir is uploaded as a GitHub Actions artifact only
 
 Columns:
   id, name, logo, restaurantSlug, branchId, branchName, branchSlug,
-  cuisineString, shopArea, area_name, shopCity, isGrocery, verticalType,
+  latitude, longitude, cuisineString, shopArea, area_name, shopCity, isGrocery, verticalType,
   shopType, isDarkstore
 
-`branchId` / `branchName` / `branchSlug` are JSON lists of all distinct branches
+`branchId` / `branchName` / `branchSlug` / `latitude` / `longitude` are JSON lists of all distinct branches
 for that restaurant id (one or many elements). Other fields use the first-seen row.
 `area_name` comes from shoparea_and_id.xlsx by matching shopArea -> area_id.
 """
@@ -52,6 +52,8 @@ COLUMNS: list[str] = [
     "branchId",
     "branchName",
     "branchSlug",
+    "latitude",
+    "longitude",
     "cuisineString",
     "shopArea",
     "area_name",
@@ -177,7 +179,13 @@ def load_records_r2(
     return records, sources
 
 
-BRANCH_LIST_COLUMNS: tuple[str, ...] = ("branchId", "branchName", "branchSlug")
+BRANCH_LIST_COLUMNS: tuple[str, ...] = (
+    "branchId",
+    "branchName",
+    "branchSlug",
+    "latitude",
+    "longitude",
+)
 
 
 def format_list_for_excel(values: list[Any]) -> str:
@@ -240,6 +248,8 @@ def unique_by_id(
             "branchId": bid,
             "branchName": item.get("branchName"),
             "branchSlug": item.get("branchSlug"),
+            "latitude": item.get("latitude"),
+            "longitude": item.get("longitude"),
         }
 
     rows: list[dict[str, Any]] = []
@@ -249,6 +259,8 @@ def unique_by_id(
         row["branchId"] = [b["branchId"] for b in branch_rows]
         row["branchName"] = [b["branchName"] for b in branch_rows]
         row["branchSlug"] = [b["branchSlug"] for b in branch_rows]
+        row["latitude"] = [b["latitude"] for b in branch_rows]
+        row["longitude"] = [b["longitude"] for b in branch_rows]
         rows.append(row)
 
     df = pd.DataFrame(rows, columns=COLUMNS)
@@ -383,7 +395,7 @@ def main() -> int:
                 {
                     "note": (
                         "One row per distinct restaurant `id` across all MergedRestaurantsInfo "
-                        "files. branchId / branchName / branchSlug are JSON lists of every distinct "
+                        "files. branchId / branchName / branchSlug / latitude / longitude are JSON lists (index-aligned) of every distinct "
                         "branch for that id (always a list, even when length is 1). "
                         "Delivery-area duplicates of the same branchId are collapsed. "
                         "Restaurant-level fields (name, logo, shopArea, etc.) come from the "
