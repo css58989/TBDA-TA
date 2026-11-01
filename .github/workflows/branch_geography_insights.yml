@@ -1,0 +1,73 @@
+name: Branch Geography Insights
+
+on:
+  workflow_dispatch:
+    inputs:
+      r2_prefix:
+        description: "R2 key prefix to scan"
+        required: false
+        default: "merged-restaurant-info/year=2025/month=09/day=17/"
+        type: string
+      key_contains:
+        description: "Only include keys containing this substring"
+        required: false
+        default: "MergedRestaurantsInfo.json"
+        type: string
+      max_files:
+        description: "Optional max files to scan (leave empty for all)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  branch-geography:
+    name: Branch-level city / area distribution and density
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run branch geography insights
+        env:
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+          R2_PREFIX: ${{ github.event.inputs.r2_prefix || 'merged-restaurant-info/year=2025/month=09/day=17/' }}
+          R2_KEY_CONTAINS: ${{ github.event.inputs.key_contains || 'MergedRestaurantsInfo.json' }}
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ -n "${{ github.event.inputs.max_files }}" ]; then
+            EXTRA_ARGS+=(--max-files "${{ github.event.inputs.max_files }}")
+          fi
+          mkdir -p outputs/branch_geography
+          # shoparea_and_id.xlsx is read from R2 under the same day prefix
+          python scripts/branch_geography_insights.py \
+            --mode r2 \
+            --prefix "${R2_PREFIX}" \
+            --key-contains "${R2_KEY_CONTAINS}" \
+            --out-dir outputs/branch_geography \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Upload GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-geography-insights
+          path: outputs/branch_geography/
+          if-no-files-found: error
+          retention-days: 30
